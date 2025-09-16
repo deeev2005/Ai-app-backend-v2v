@@ -269,6 +269,7 @@ async def _process_input_video(video_path: str):
     try:
         import subprocess
         import json
+        from PIL import Image  # Add this import
         
         # Get video duration and frame count
         cmd = [
@@ -306,6 +307,19 @@ async def _process_input_video(video_path: str):
         if result.returncode != 0:
             raise Exception(f"Middle frame extraction failed: {result.stderr}")
         
+        # Rotate the middle frame 90 degrees clockwise
+        rotated_frame_path = temp_dir / f"{unique_id}_middle_frame_rotated.jpg"
+        image = Image.open(middle_frame_path)
+        rotated_image = image.rotate(-90, expand=True)  # -90 for clockwise rotation
+        rotated_image.save(rotated_frame_path, quality=95)
+        image.close()
+        rotated_image.close()
+        
+        # Clean up original middle frame since we have the rotated version
+        middle_frame_path.unlink()
+        
+        logger.info(f"Middle frame rotated 90 degrees clockwise: {rotated_frame_path}")
+        
         # Extract first part (from start to middle)
         first_part_path = temp_dir / f"{unique_id}_first_part.mp4"
         cmd = [
@@ -320,7 +334,7 @@ async def _process_input_video(video_path: str):
         if result.returncode != 0:
             raise Exception(f"First part extraction failed: {result.stderr}")
         
-        return str(middle_frame_path), str(first_part_path), second_part_duration
+        return str(rotated_frame_path), str(first_part_path), second_part_duration
         
     except Exception as e:
         logger.error(f"Failed to process input video: {e}")
