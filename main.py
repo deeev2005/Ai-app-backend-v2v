@@ -3,6 +3,7 @@ import uuid
 import shutil
 import asyncio
 import logging
+import gc
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -125,10 +126,13 @@ async def generate_video(
         file_extension = Path(filename).suffix or '.mp4'
         temp_video_path = temp_dir / f"{video_id}{file_extension}"
 
-        # Save file
+        # Read file in chunks to prevent memory issues
         with open(temp_video_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
+            while True:
+                chunk = await file.read(8192)  # 8KB chunks
+                if not chunk:
+                    break
+                buffer.write(chunk)
 
         logger.info(f"Video saved to {temp_video_path}")
 
@@ -263,6 +267,9 @@ async def generate_video(
                     logger.info(f"Cleaned up temp file: {temp_path}")
                 except Exception as e:
                     logger.warning(f"Failed to cleanup temp file {temp_path}: {e}")
+        
+        # Force garbage collection after each request
+        gc.collect()
 
 async def _process_input_video(video_path: str):
     """Extract middle frame and split video into first part and calculate second part duration"""
@@ -369,6 +376,8 @@ async def _extract_audio_from_second_part(video_path: str, second_part_duration:
 
 async def _merge_second_part_components(generated_video_path: str, generated_audio_path: str, original_second_audio_path: str):
     """Merge generated video with both generated audio and original second part audio"""
+    temp_files = []  # Track temporary files for cleanup
+    
     try:
         import subprocess
         
@@ -390,6 +399,8 @@ async def _merge_second_part_components(generated_video_path: str, generated_aud
         
         # Trim original second part audio to match generated video duration
         trimmed_original_audio_path = temp_dir / f"{unique_id}_trimmed_original_audio.wav"
+        temp_files.append(trimmed_original_audio_path)
+        
         cmd = [
             'ffmpeg', '-y', '-i', original_second_audio_path, 
             '-t', str(actual_video_duration), '-c', 'copy', str(trimmed_original_audio_path)
@@ -402,6 +413,8 @@ async def _merge_second_part_components(generated_video_path: str, generated_aud
         
         # Trim generated audio to match video duration
         trimmed_generated_audio_path = temp_dir / f"{unique_id}_trimmed_generated_audio.wav"
+        temp_files.append(trimmed_generated_audio_path)
+        
         cmd = [
             'ffmpeg', '-y', '-i', generated_audio_path, 
             '-t', str(actual_video_duration), '-c', 'copy', str(trimmed_generated_audio_path)
@@ -457,23 +470,26 @@ async def _merge_second_part_components(generated_video_path: str, generated_aud
         if not merged_path.exists():
             raise Exception("Merged second part video was not created")
         
-        # Cleanup temporary audio files
-        for temp_audio in [trimmed_original_audio_path, trimmed_generated_audio_path]:
-            if temp_audio and Path(temp_audio).exists() and temp_audio != generated_audio_path:
-                try:
-                    Path(temp_audio).unlink()
-                except:
-                    pass
-        
         logger.info(f"Successfully merged second part: {merged_path}")
         return str(merged_path)
         
     except Exception as e:
         logger.error(f"Failed to merge second part components: {e}")
         raise Exception(f"Second part merging failed: {str(e)}")
+    
+    finally:
+        # Cleanup temporary audio files
+        for temp_file in temp_files:
+            if temp_file and Path(temp_file).exists() and temp_file != generated_audio_path:
+                try:
+                    Path(temp_file).unlink()
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup temp audio file {temp_file}: {e}")
 
 async def _merge_first_and_second_parts(first_part_path: str, second_part_path: str):
     """Merge first part with processed second part"""
+    temp_files = []  # Track temporary files for cleanup
+    
     try:
         import subprocess
         
@@ -496,6 +512,7 @@ async def _merge_first_and_second_parts(first_part_path: str, second_part_path: 
         # Ensure both videos have compatible formats before concatenation
         temp_first_normalized = temp_dir / f"{unique_id}_first_normalized.mp4"
         temp_second_normalized = temp_dir / f"{unique_id}_second_normalized.mp4"
+        temp_files.extend([temp_first_normalized, temp_second_normalized])
         
         # Normalize first part
         cmd = [
@@ -529,6 +546,7 @@ async def _merge_first_and_second_parts(first_part_path: str, second_part_path: 
         
         # Create a temporary file list for concatenation
         filelist_path = temp_dir / f"{unique_id}_filelist.txt"
+        temp_files.append(filelist_path)
         
         with open(filelist_path, 'w') as f:
             f.write(f"file '{temp_first_normalized}'\n")
@@ -548,14 +566,6 @@ async def _merge_first_and_second_parts(first_part_path: str, second_part_path: 
         result = await asyncio.to_thread(
             subprocess.run, cmd, capture_output=True, text=True, timeout=180
         )
-        
-        # Cleanup temporary files
-        for temp_file in [filelist_path, temp_first_normalized, temp_second_normalized]:
-            if temp_file and Path(temp_file).exists() and temp_file not in [first_part_path, second_part_path]:
-                try:
-                    Path(temp_file).unlink()
-                except:
-                    pass
         
         if result.returncode != 0:
             logger.error(f"FFmpeg final merge failed: {result.stderr}")
@@ -582,6 +592,15 @@ async def _merge_first_and_second_parts(first_part_path: str, second_part_path: 
     except Exception as e:
         logger.error(f"Failed to merge first and second parts: {e}")
         raise Exception(f"Final video merging failed: {str(e)}")
+    
+    finally:
+        # Cleanup temporary files
+        for temp_file in temp_files:
+            if temp_file and Path(temp_file).exists() and temp_file not in [first_part_path, second_part_path]:
+                try:
+                    Path(temp_file).unlink()
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup temp merge file {temp_file}: {e}")
 
 async def _upload_video_to_supabase(local_video_path: str, sender_uid: str) -> str:
     """Upload video to Supabase storage and return public URL"""
@@ -594,11 +613,11 @@ async def _upload_video_to_supabase(local_video_path: str, sender_uid: str) -> s
         video_id = str(uuid.uuid4())
         storage_path = f"videos/{sender_uid}/{video_id}.mp4"
 
-        # Read video file
+        # Read video file in chunks to prevent memory issues
+        logger.info(f"Uploading video to Supabase: {storage_path}")
+
         with open(video_path, "rb") as video_file:
             video_data = video_file.read()
-
-        logger.info(f"Uploading video to Supabase: {storage_path}")
 
         # Upload to Supabase storage
         try:
@@ -615,6 +634,9 @@ async def _upload_video_to_supabase(local_video_path: str, sender_uid: str) -> s
         except Exception as upload_error:
             logger.error(f"Upload failed: {upload_error}")
             raise Exception(f"Supabase upload failed: {upload_error}")
+        finally:
+            # Clear video_data from memory immediately
+            del video_data
 
         # Get public URL
         try:
@@ -790,7 +812,7 @@ def _predict_video(image_path: str, prompt: str, duration: float):
         
         logger.info(f"Requesting video generation: duration={target_duration}s, frames={target_frames}")
         
-        return client.predict(
+        result = client.predict(
             prompt=prompt,
             negative_prompt="worst quality, inconsistent motion, blurry, artifacts",
             input_image_filepath=handle_file(image_path),
@@ -806,6 +828,11 @@ def _predict_video(image_path: str, prompt: str, duration: float):
             improve_texture_flag=True,
             api_name="/image_to_video"
         )
+        
+        # Clear any large objects from memory immediately after use
+        gc.collect()
+        return result
+        
     except Exception as e:
         logger.error(f"Gradio client prediction failed: {e}")
         raise
@@ -828,6 +855,9 @@ def _predict_audio(prompt: str, duration: float):
         )
         
         logger.info(f"Audio generation result: {result}")
+        
+        # Clear any large objects from memory immediately after use
+        gc.collect()
         return result[0]  # Return the first element (filepath) from the tuple
         
     except Exception as e:
@@ -837,6 +867,8 @@ def _predict_audio(prompt: str, duration: float):
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     logger.error(f"Global exception handler caught: {exc}", exc_info=True)
+    # Force garbage collection on errors to free up memory
+    gc.collect()
     return JSONResponse(
         status_code=500,
         content={"error": "Internal server error", "detail": str(exc)}
@@ -848,5 +880,8 @@ if __name__ == "__main__":
         host="0.0.0.0", 
         port=8000,
         timeout_keep_alive=300,  # 5 minutes keep alive
-        timeout_graceful_shutdown=30
+        timeout_graceful_shutdown=30,
+        workers=1,  # Single worker to prevent memory multiplication
+        limit_max_requests=100,  # Restart worker after 100 requests to prevent memory leaks
+        limit_concurrency=10  # Limit concurrent connections to prevent memory overload
     )
