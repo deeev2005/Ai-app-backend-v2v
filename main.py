@@ -269,7 +269,6 @@ async def _process_input_video(video_path: str):
     try:
         import subprocess
         import json
-        from PIL import Image  # Add this import
         
         # Get video duration and frame count
         cmd = [
@@ -307,19 +306,6 @@ async def _process_input_video(video_path: str):
         if result.returncode != 0:
             raise Exception(f"Middle frame extraction failed: {result.stderr}")
         
-        # Rotate the middle frame 90 degrees clockwise
-        rotated_frame_path = temp_dir / f"{unique_id}_middle_frame_rotated.jpg"
-        image = Image.open(middle_frame_path)
-        rotated_image = image.rotate(-90, expand=True)  # -90 for clockwise rotation
-        rotated_image.save(rotated_frame_path, quality=95)
-        image.close()
-        rotated_image.close()
-        
-        # Clean up original middle frame since we have the rotated version
-        middle_frame_path.unlink()
-        
-        logger.info(f"Middle frame rotated 90 degrees clockwise: {rotated_frame_path}")
-        
         # Extract first part (from start to middle)
         first_part_path = temp_dir / f"{unique_id}_first_part.mp4"
         cmd = [
@@ -334,7 +320,7 @@ async def _process_input_video(video_path: str):
         if result.returncode != 0:
             raise Exception(f"First part extraction failed: {result.stderr}")
         
-        return str(rotated_frame_path), str(first_part_path), second_part_duration
+        return str(middle_frame_path), str(first_part_path), second_part_duration
         
     except Exception as e:
         logger.error(f"Failed to process input video: {e}")
@@ -388,27 +374,80 @@ async def _merge_second_part_components(generated_video_path: str, generated_aud
         
         temp_dir = Path("/tmp")
         unique_id = str(uuid.uuid4())
-        merged_path = temp_dir / f"{unique_id}_merged_second_part.mp4"
         
-        logger.info(f"Merging generated video with generated audio and original second part audio")
+        # First, let's check the actual duration of generated video
+        cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', generated_video_path]
+        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
         
-        # Merge generated video with generated audio + original audio (mix both audio tracks)
+        if result.returncode == 0:
+            import json
+            video_info = json.loads(result.stdout)
+            actual_video_duration = float(video_info['format']['duration'])
+            logger.info(f"Generated video actual duration: {actual_video_duration}s")
+        else:
+            actual_video_duration = 2.0  # fallback
+            logger.warning(f"Could not get video duration, using fallback: {actual_video_duration}s")
+        
+        # Trim original second part audio to match generated video duration
+        trimmed_original_audio_path = temp_dir / f"{unique_id}_trimmed_original_audio.wav"
         cmd = [
-            'ffmpeg', '-y',
-            '-i', generated_video_path,  # Generated video
-            '-i', generated_audio_path,  # Generated audio
-            '-i', original_second_audio_path,  # Original second part audio
-            '-filter_complex', '[1:a][2:a]amix=inputs=2[mixedaudio]',  # Mix both audio tracks
-            '-map', '0:v',  # Use video from first input
-            '-map', '[mixedaudio]',  # Use mixed audio
-            '-c:v', 'copy',  # Copy video codec
-            '-c:a', 'aac',  # Encode audio to AAC
-            '-shortest',  # Finish when shortest stream ends
-            str(merged_path)
+            'ffmpeg', '-y', '-i', original_second_audio_path, 
+            '-t', str(actual_video_duration), '-c', 'copy', str(trimmed_original_audio_path)
         ]
         
+        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.warning(f"Failed to trim original audio, proceeding without it")
+            trimmed_original_audio_path = None
+        
+        # Trim generated audio to match video duration
+        trimmed_generated_audio_path = temp_dir / f"{unique_id}_trimmed_generated_audio.wav"
+        cmd = [
+            'ffmpeg', '-y', '-i', generated_audio_path, 
+            '-t', str(actual_video_duration), '-c', 'copy', str(trimmed_generated_audio_path)
+        ]
+        
+        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.warning(f"Failed to trim generated audio")
+            trimmed_generated_audio_path = generated_audio_path  # use original
+        
+        merged_path = temp_dir / f"{unique_id}_merged_second_part.mp4"
+        
+        logger.info(f"Merging generated video with audio tracks")
+        
+        # Build ffmpeg command based on available audio
+        if trimmed_original_audio_path and Path(trimmed_original_audio_path).exists():
+            # Mix both audio tracks
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', generated_video_path,  # Generated video
+                '-i', str(trimmed_generated_audio_path),  # Generated audio
+                '-i', str(trimmed_original_audio_path),  # Original second part audio
+                '-filter_complex', '[1:a][2:a]amix=inputs=2:duration=shortest:dropout_transition=2[mixedaudio]',
+                '-map', '0:v',  # Use video from first input
+                '-map', '[mixedaudio]',  # Use mixed audio
+                '-c:v', 'libx264',  # Re-encode video for compatibility
+                '-c:a', 'aac',  # Encode audio to AAC
+                '-shortest',  # Finish when shortest stream ends
+                '-avoid_negative_ts', 'make_zero',  # Fix timing issues
+                str(merged_path)
+            ]
+        else:
+            # Use only generated audio
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', generated_video_path,  # Generated video
+                '-i', str(trimmed_generated_audio_path),  # Generated audio only
+                '-c:v', 'libx264',  # Re-encode video for compatibility
+                '-c:a', 'aac',  # Encode audio to AAC
+                '-shortest',  # Finish when shortest stream ends
+                '-avoid_negative_ts', 'make_zero',  # Fix timing issues
+                str(merged_path)
+            ]
+        
         result = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True, timeout=120
+            subprocess.run, cmd, capture_output=True, text=True, timeout=180
         )
         
         if result.returncode != 0:
@@ -417,6 +456,14 @@ async def _merge_second_part_components(generated_video_path: str, generated_aud
         
         if not merged_path.exists():
             raise Exception("Merged second part video was not created")
+        
+        # Cleanup temporary audio files
+        for temp_audio in [trimmed_original_audio_path, trimmed_generated_audio_path]:
+            if temp_audio and Path(temp_audio).exists() and temp_audio != generated_audio_path:
+                try:
+                    Path(temp_audio).unlink()
+                except:
+                    pass
         
         logger.info(f"Successfully merged second part: {merged_path}")
         return str(merged_path)
@@ -432,29 +479,83 @@ async def _merge_first_and_second_parts(first_part_path: str, second_part_path: 
         
         temp_dir = Path("/tmp")
         unique_id = str(uuid.uuid4())
+        
+        # First, get duration of both parts to verify they match expected lengths
+        for part_name, part_path in [("first", first_part_path), ("second", second_part_path)]:
+            cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', part_path]
+            result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                import json
+                video_info = json.loads(result.stdout)
+                duration = float(video_info['format']['duration'])
+                logger.info(f"{part_name} part duration: {duration}s")
+            else:
+                logger.warning(f"Could not get {part_name} part duration")
+        
+        # Ensure both videos have compatible formats before concatenation
+        temp_first_normalized = temp_dir / f"{unique_id}_first_normalized.mp4"
+        temp_second_normalized = temp_dir / f"{unique_id}_second_normalized.mp4"
+        
+        # Normalize first part
+        cmd = [
+            'ffmpeg', '-y', '-i', first_part_path,
+            '-c:v', 'libx264', '-c:a', 'aac',
+            '-r', '24', '-pix_fmt', 'yuv420p',
+            '-avoid_negative_ts', 'make_zero',
+            str(temp_first_normalized)
+        ]
+        
+        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.error(f"First part normalization failed: {result.stderr}")
+            temp_first_normalized = first_part_path  # use original
+        
+        # Normalize second part
+        cmd = [
+            'ffmpeg', '-y', '-i', second_part_path,
+            '-c:v', 'libx264', '-c:a', 'aac',
+            '-r', '24', '-pix_fmt', 'yuv420p',
+            '-avoid_negative_ts', 'make_zero',
+            str(temp_second_normalized)
+        ]
+        
+        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.error(f"Second part normalization failed: {result.stderr}")
+            temp_second_normalized = second_part_path  # use original
+        
         final_path = temp_dir / f"{unique_id}_final_video.mp4"
         
         # Create a temporary file list for concatenation
         filelist_path = temp_dir / f"{unique_id}_filelist.txt"
         
         with open(filelist_path, 'w') as f:
-            f.write(f"file '{first_part_path}'\n")
-            f.write(f"file '{second_part_path}'\n")
+            f.write(f"file '{temp_first_normalized}'\n")
+            f.write(f"file '{temp_second_normalized}'\n")
         
-        logger.info(f"Merging first part with processed second part")
+        logger.info(f"Concatenating normalized parts")
         
-        # Concatenate videos
+        # Concatenate videos using concat demuxer (more reliable)
         cmd = [
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0', 
-            '-i', str(filelist_path), '-c', 'copy', str(final_path)
+            '-i', str(filelist_path), 
+            '-c:v', 'libx264', '-c:a', 'aac',  # Re-encode for consistency
+            '-avoid_negative_ts', 'make_zero',
+            str(final_path)
         ]
         
         result = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True, timeout=120
+            subprocess.run, cmd, capture_output=True, text=True, timeout=180
         )
         
-        # Cleanup filelist
-        filelist_path.unlink()
+        # Cleanup temporary files
+        for temp_file in [filelist_path, temp_first_normalized, temp_second_normalized]:
+            if temp_file and Path(temp_file).exists() and temp_file not in [first_part_path, second_part_path]:
+                try:
+                    Path(temp_file).unlink()
+                except:
+                    pass
         
         if result.returncode != 0:
             logger.error(f"FFmpeg final merge failed: {result.stderr}")
@@ -462,6 +563,18 @@ async def _merge_first_and_second_parts(first_part_path: str, second_part_path: 
         
         if not final_path.exists():
             raise Exception("Final merged video was not created")
+        
+        # Verify final video duration
+        cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', str(final_path)]
+        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            import json
+            video_info = json.loads(result.stdout)
+            final_duration = float(video_info['format']['duration'])
+            logger.info(f"Final video duration: {final_duration}s")
+        else:
+            logger.warning("Could not verify final video duration")
         
         logger.info(f"Successfully created final video: {final_path}")
         return str(final_path)
@@ -670,8 +783,12 @@ async def _save_chat_messages_to_firebase(sender_uid: str, receiver_list: list, 
 def _predict_video(image_path: str, prompt: str, duration: float):
     """Synchronous function to call the Gradio client with specific duration"""
     try:
-        # Convert duration to frames (assuming ~30fps, minimum 9 frames)
-        target_frames = max(9, int(duration * 30))
+        # LTX typically generates 2-5 second videos, so we'll use minimum 2 seconds
+        # and ensure we don't exceed typical limits
+        target_duration = max(2.0, min(duration, 5.0))
+        target_frames = max(9, int(target_duration * 24))  # 24fps is more common for LTX
+        
+        logger.info(f"Requesting video generation: duration={target_duration}s, frames={target_frames}")
         
         return client.predict(
             prompt=prompt,
@@ -681,8 +798,8 @@ def _predict_video(image_path: str, prompt: str, duration: float):
             height_ui=960,
             width_ui=544,
             mode="image-to-video",
-            duration_ui=duration,  # Use calculated duration
-            ui_frames_to_use= 9,
+            duration_ui=5,  # Use constrained duration
+            ui_frames_to_use=9,
             seed_ui=42,
             randomize_seed=True,
             ui_guidance_scale=5,
@@ -696,11 +813,13 @@ def _predict_video(image_path: str, prompt: str, duration: float):
 def _predict_audio(prompt: str, duration: float):
     """Synchronous function to call the Audio Gradio client with specific duration"""
     try:
-        logger.info(f"Generating audio with prompt: {prompt}, duration: {duration}")
+        # Constrain audio duration to match video constraints
+        target_duration = max(2.0, min(duration, 5.0))
+        logger.info(f"Generating audio with prompt: {prompt}, duration: {target_duration}")
         
         result = audio_client.predict(
             prompt=prompt,
-            duration=duration,  # Use calculated duration
+            duration=5,  # Use constrained duration
             cfg_strength=4.5,
             num_steps=1,
             variant="meanaudio_s_full",
