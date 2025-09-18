@@ -394,7 +394,7 @@ async def _stitch_final_video(first_half_path: str, generated_video_path: str,
             'ffmpeg', '-y',
             '-i', generated_video_path,
             '-i', generated_audio_path,
-            '-vf', f'scale={original_width}:{original_height}',
+            '-vf', f'scale={original_width}:{original_height}:force_original_aspect_ratio=decrease,pad={original_width}:{original_height}:(ow-iw)/2:(oh-ih)/2:black',
             '-r', str(eval(original_fps)),  # Match original fps
             '-t', '5.0',  # Force exactly 5 seconds
             '-c:v', 'libx264', '-crf', '23',
