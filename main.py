@@ -288,7 +288,7 @@ async def _process_video_standardized(video_path: str) -> tuple:
         cmd_frame = [
             'ffmpeg', '-y', '-i', video_path,
             '-ss', str(middle_time), '-vframes', '1',
-            '-vf', f'transpose=1,scale={STANDARD_WIDTH}:{STANDARD_HEIGHT}:force_original_aspect_ratio=decrease,pad={STANDARD_WIDTH}:{STANDARD_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black',
+            '-vf', f'scale={STANDARD_WIDTH}:{STANDARD_HEIGHT}:force_original_aspect_ratio=decrease,pad={STANDARD_WIDTH}:{STANDARD_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black',
             str(middle_frame_path)
         ]
         
