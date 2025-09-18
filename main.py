@@ -46,6 +46,11 @@ client = None
 audio_client = None
 supabase: SupabaseClient = None
 
+# Standard video parameters to ensure consistency
+STANDARD_WIDTH = 544
+STANDARD_HEIGHT = 960
+STANDARD_FPS = 24  # Use 24fps as standard (works well for most content)
+
 @app.on_event("startup")
 async def startup_event():
     global client, audio_client, supabase
@@ -83,14 +88,7 @@ async def generate_video(
     receiver_uids: str = Form(...)
 ):
     """Generate video from video input and prompt, add audio, then merge them"""
-    temp_video_path = None
-    temp_middle_frame_path = None
-    temp_first_part_path = None
-    temp_last_part_audio_path = None
-    temp_ai_video_path = None
-    temp_ai_audio_path = None
-    temp_ai_merged_path = None
-    temp_final_path = None
+    temp_files = []  # Track all temp files for cleanup
 
     try:
         # Improved video validation
@@ -114,7 +112,6 @@ async def generate_video(
         logger.info(f"Starting video generation for user {sender_uid}")
         logger.info(f"Prompt: {prompt}")
         logger.info(f"Receivers: {receiver_uids}")
-        logger.info(f"File info - Content-Type: {content_type}, Filename: {filename}")
 
         # Create temp directory if it doesn't exist
         temp_dir = Path("/tmp")
@@ -124,6 +121,7 @@ async def generate_video(
         video_id = str(uuid.uuid4())
         file_extension = Path(filename).suffix or '.mp4'
         temp_video_path = temp_dir / f"{video_id}{file_extension}"
+        temp_files.append(temp_video_path)
 
         # Save file
         with open(temp_video_path, "wb") as buffer:
@@ -147,9 +145,10 @@ async def generate_video(
         if supabase is None:
             raise HTTPException(status_code=503, detail="Storage service not available")
 
-        # Extract middle frame and split video
+        # Process video with standardized parameters
         logger.info("Processing video: extracting middle frame and splitting...")
-        middle_frame_path, first_part_path, last_part_audio_path = await _process_video(str(temp_video_path))
+        middle_frame_path, first_part_path, last_part_path = await _process_video_standardized(str(temp_video_path))
+        temp_files.extend([middle_frame_path, first_part_path, last_part_path])
 
         # Start both AI video and AI audio generation concurrently
         logger.info("Starting AI video and audio generation concurrently...")
@@ -185,21 +184,22 @@ async def generate_video(
         logger.info(f"AI Video generated locally: {ai_video_path}")
         logger.info(f"AI Audio generated locally: {ai_audio_path}")
 
-        # Merge AI video with AI audio to create the middle part
-        ai_merged_path = await _merge_video_audio(ai_video_path, ai_audio_path)
+        # Standardize AI video to match our requirements
+        ai_video_standardized = await _standardize_video(ai_video_path, is_ai_video=True)
+        temp_files.append(ai_video_standardized)
+
+        # Merge AI video with AI audio
+        ai_merged_path = await _merge_video_audio_standardized(ai_video_standardized, ai_audio_path)
+        temp_files.append(ai_merged_path)
         logger.info(f"AI video and audio merged: {ai_merged_path}")
 
-        # Merge AI part with original last part audio
-        last_part_with_ai = await _merge_ai_with_original_audio(ai_merged_path, last_part_audio_path)
-        logger.info(f"AI part merged with original last part audio: {last_part_with_ai}")
-
-        # Final merge: first_part + (ai_part + last_part_audio)
-        final_video_path = await _merge_final_video(first_part_path, last_part_with_ai)
+        # Create final video by concatenating all three parts
+        final_video_path = await _concatenate_videos_standardized([first_part_path, ai_merged_path, last_part_path])
+        temp_files.append(final_video_path)
         logger.info(f"Final video created: {final_video_path}")
 
         # Upload final video to Supabase storage
         video_url = await _upload_video_to_supabase(final_video_path, sender_uid)
-
         logger.info(f"Final video uploaded to Supabase: {video_url}")
 
         # Save chat messages to Firebase for each receiver
@@ -234,9 +234,7 @@ async def generate_video(
 
     finally:
         # Cleanup temporary files
-        for temp_path in [temp_video_path, temp_middle_frame_path, temp_first_part_path, 
-                         temp_last_part_audio_path, temp_ai_video_path, temp_ai_audio_path, 
-                         temp_ai_merged_path, temp_final_path]:
+        for temp_path in temp_files:
             if temp_path and Path(temp_path).exists():
                 try:
                     Path(temp_path).unlink()
@@ -244,39 +242,53 @@ async def generate_video(
                 except Exception as e:
                     logger.warning(f"Failed to cleanup temp file {temp_path}: {e}")
 
-async def _process_video(video_path: str) -> tuple:
-    """Extract middle frame and split video into first part and last part audio"""
+async def _process_video_standardized(video_path: str) -> tuple:
+    """Extract middle frame and split video into standardized parts"""
     try:
         import subprocess
         
         temp_dir = Path("/tmp")
         process_id = str(uuid.uuid4())
         
-        # Get video duration
-        cmd_duration = [
-            'ffprobe', '-v', 'error', '-show_entries',
-            'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1',
-            video_path
+        # Get video properties first
+        cmd_info = [
+            'ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams',
+            '-show_format', video_path
         ]
         
         result = await asyncio.to_thread(
-            subprocess.run, cmd_duration, capture_output=True, text=True, timeout=30
+            subprocess.run, cmd_info, capture_output=True, text=True, timeout=30
         )
         
         if result.returncode != 0:
-            raise Exception(f"Failed to get video duration: {result.stderr}")
+            raise Exception(f"Failed to get video info: {result.stderr}")
         
-        duration = float(result.stdout.strip())
+        import json
+        video_info = json.loads(result.stdout)
+        
+        # Find video stream
+        video_stream = next((stream for stream in video_info['streams'] if stream['codec_type'] == 'video'), None)
+        if not video_stream:
+            raise Exception("No video stream found")
+        
+        # Get video properties
+        duration = float(video_info['format']['duration'])
+        original_fps = eval(video_stream['r_frame_rate'])  # This gives exact fps as fraction
+        
+        logger.info(f"Original video - Duration: {duration}s, FPS: {original_fps}")
+        
+        # Calculate split points
         middle_time = duration / 2
+        ai_duration = 5.0  # AI video is exactly 5 seconds
         
-        logger.info(f"Video duration: {duration}s, middle time: {middle_time}s")
+        logger.info(f"Split points - Middle: {middle_time}s, AI duration: {ai_duration}s")
         
-        # Extract middle frame and rotate 90 degrees clockwise
+        # Extract middle frame with rotation and resize to match AI output
         middle_frame_path = temp_dir / f"{process_id}_middle_frame.jpg"
         cmd_frame = [
             'ffmpeg', '-y', '-i', video_path,
             '-ss', str(middle_time), '-vframes', '1',
-            '-vf', 'transpose=1',  # transpose=1 rotates 90 degrees clockwise
+            '-vf', f'transpose=1,scale={STANDARD_WIDTH}:{STANDARD_HEIGHT}:force_original_aspect_ratio=decrease,pad={STANDARD_WIDTH}:{STANDARD_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black',
             str(middle_frame_path)
         ]
         
@@ -287,11 +299,16 @@ async def _process_video(video_path: str) -> tuple:
         if result.returncode != 0:
             raise Exception(f"Failed to extract middle frame: {result.stderr}")
         
-        # Extract first part (start to middle)
+        # Extract and standardize first part (start to middle)
         first_part_path = temp_dir / f"{process_id}_first_part.mp4"
         cmd_first = [
             'ffmpeg', '-y', '-i', video_path,
-            '-t', str(middle_time), '-c', 'copy',
+            '-t', str(middle_time),
+            '-vf', f'scale={STANDARD_WIDTH}:{STANDARD_HEIGHT}:force_original_aspect_ratio=decrease,pad={STANDARD_WIDTH}:{STANDARD_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black',
+            '-r', str(STANDARD_FPS),  # Standardize FPS
+            '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-movflags', '+faststart',
             str(first_part_path)
         ]
         
@@ -302,139 +319,145 @@ async def _process_video(video_path: str) -> tuple:
         if result.returncode != 0:
             raise Exception(f"Failed to extract first part: {result.stderr}")
         
-        # Extract audio from last part (middle to end)
-        last_part_audio_path = temp_dir / f"{process_id}_last_part_audio.aac"
-        cmd_last_audio = [
-            'ffmpeg', '-y', '-i', video_path,
-            '-ss', str(middle_time), '-vn', '-acodec', 'aac',
-            str(last_part_audio_path)
-        ]
+        # Extract and standardize last part (middle + ai_duration to end)
+        last_part_start = middle_time + ai_duration
+        last_part_path = temp_dir / f"{process_id}_last_part.mp4"
         
-        result = await asyncio.to_thread(
-            subprocess.run, cmd_last_audio, capture_output=True, text=True, timeout=120
-        )
-        
-        if result.returncode != 0:
-            raise Exception(f"Failed to extract last part audio: {result.stderr}")
+        if last_part_start < duration:  # Only if there's content after AI part
+            cmd_last = [
+                'ffmpeg', '-y', '-i', video_path,
+                '-ss', str(last_part_start),
+                '-vf', f'scale={STANDARD_WIDTH}:{STANDARD_HEIGHT}:force_original_aspect_ratio=decrease,pad={STANDARD_WIDTH}:{STANDARD_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black',
+                '-r', str(STANDARD_FPS),  # Standardize FPS
+                '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-movflags', '+faststart',
+                str(last_part_path)
+            ]
+            
+            result = await asyncio.to_thread(
+                subprocess.run, cmd_last, capture_output=True, text=True, timeout=120
+            )
+            
+            if result.returncode != 0:
+                raise Exception(f"Failed to extract last part: {result.stderr}")
+        else:
+            # Create empty video file if no last part exists
+            cmd_empty = [
+                'ffmpeg', '-y', '-f', 'lavfi', '-i', f'color=black:size={STANDARD_WIDTH}x{STANDARD_HEIGHT}:duration=0.1:rate={STANDARD_FPS}',
+                '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
+                '-c:v', 'libx264', '-c:a', 'aac', '-shortest',
+                str(last_part_path)
+            ]
+            
+            result = await asyncio.to_thread(
+                subprocess.run, cmd_empty, capture_output=True, text=True, timeout=30
+            )
+            
+            if result.returncode != 0:
+                raise Exception(f"Failed to create empty last part: {result.stderr}")
         
         logger.info(f"Video processing complete:")
         logger.info(f"- Middle frame: {middle_frame_path}")
         logger.info(f"- First part: {first_part_path}")
-        logger.info(f"- Last part audio: {last_part_audio_path}")
+        logger.info(f"- Last part: {last_part_path}")
         
-        return str(middle_frame_path), str(first_part_path), str(last_part_audio_path)
+        return str(middle_frame_path), str(first_part_path), str(last_part_path)
         
     except Exception as e:
         logger.error(f"Failed to process video: {e}")
         raise Exception(f"Video processing failed: {str(e)}")
 
-async def _merge_video_audio(video_path: str, audio_path: str) -> str:
-    """Merge video and audio files using ffmpeg"""
+async def _standardize_video(video_path: str, is_ai_video: bool = False) -> str:
+    """Standardize video to consistent format"""
     try:
         import subprocess
         
-        # Generate output path
         temp_dir = Path("/tmp")
         output_id = str(uuid.uuid4())
-        merged_path = temp_dir / f"{output_id}_ai_merged.mp4"
+        standardized_path = temp_dir / f"{output_id}_standardized.mp4"
         
-        logger.info(f"Merging AI video {video_path} with AI audio {audio_path}")
+        logger.info(f"Standardizing video: {video_path}")
         
-        # Use ffmpeg to merge video and audio
-        cmd = [
-            'ffmpeg', '-y',  # -y to overwrite output file
-            '-i', video_path,  # input video
-            '-i', audio_path,  # input audio
-            '-c:v', 'copy',    # copy video codec (no re-encoding)
-            '-c:a', 'aac',     # encode audio to AAC
-            '-strict', 'experimental',
-            '-shortest',       # finish when shortest stream ends
-            str(merged_path)
-        ]
+        if is_ai_video:
+            # AI video should already be correct size but ensure FPS and encoding
+            cmd = [
+                'ffmpeg', '-y', '-i', video_path,
+                '-r', str(STANDARD_FPS),  # Ensure standard FPS
+                '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-movflags', '+faststart',
+                '-t', '5.0',  # Ensure exactly 5 seconds
+                str(standardized_path)
+            ]
+        else:
+            # Regular video - scale and standardize
+            cmd = [
+                'ffmpeg', '-y', '-i', video_path,
+                '-vf', f'scale={STANDARD_WIDTH}:{STANDARD_HEIGHT}:force_original_aspect_ratio=decrease,pad={STANDARD_WIDTH}:{STANDARD_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black',
+                '-r', str(STANDARD_FPS),
+                '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-movflags', '+faststart',
+                str(standardized_path)
+            ]
         
-        # Run ffmpeg command
         result = await asyncio.to_thread(
-            subprocess.run, cmd, 
-            capture_output=True, 
-            text=True, 
-            timeout=120  # 2 minute timeout for merging
+            subprocess.run, cmd, capture_output=True, text=True, timeout=120
         )
         
         if result.returncode != 0:
-            logger.error(f"FFmpeg failed: {result.stderr}")
-            raise Exception(f"AI Video-audio merging failed: {result.stderr}")
+            logger.error(f"FFmpeg standardization failed: {result.stderr}")
+            raise Exception(f"Video standardization failed: {result.stderr}")
         
-        if not merged_path.exists():
-            raise Exception("AI Merged video file was not created")
-        
-        logger.info(f"Successfully merged AI video and audio: {merged_path}")
-        return str(merged_path)
+        logger.info(f"Successfully standardized video: {standardized_path}")
+        return str(standardized_path)
         
     except Exception as e:
-        logger.error(f"Failed to merge AI video and audio: {e}")
-        raise Exception(f"AI Video-audio merging failed: {str(e)}")
+        logger.error(f"Failed to standardize video: {e}")
+        raise Exception(f"Video standardization failed: {str(e)}")
 
-async def _merge_ai_with_original_audio(ai_video_path: str, original_audio_path: str) -> str:
-    """Merge AI video+audio with original last part audio"""
+async def _merge_video_audio_standardized(video_path: str, audio_path: str) -> str:
+    """Merge video and audio with exact duration matching"""
     try:
         import subprocess
         
         temp_dir = Path("/tmp")
         output_id = str(uuid.uuid4())
-        merged_path = temp_dir / f"{output_id}_ai_with_original.mp4"
+        merged_path = temp_dir / f"{output_id}_merged.mp4"
         
-        logger.info(f"Merging AI video with original last part audio")
+        logger.info(f"Merging video {video_path} with audio {audio_path}")
         
-        # Concatenate AI video (5sec) with original audio
-        # First create a silent video for the original audio duration
-        # Get original audio duration
-        cmd_duration = [
-            'ffprobe', '-v', 'error', '-show_entries',
-            'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1',
-            original_audio_path
-        ]
-        
-        result = await asyncio.to_thread(
-            subprocess.run, cmd_duration, capture_output=True, text=True, timeout=30
-        )
-        
-        if result.returncode != 0:
-            raise Exception(f"Failed to get original audio duration: {result.stderr}")
-        
-        original_audio_duration = float(result.stdout.strip())
-        
-        # Create the final merged video: AI video (5sec) + black screen with original audio
+        # Merge with exact 5-second duration
         cmd = [
             'ffmpeg', '-y',
-            '-i', ai_video_path,  # AI video (5sec with AI audio)
-            '-i', original_audio_path,  # Original last part audio
-            '-filter_complex', 
-            f'[0:v]pad=iw:ih:0:0:black,setpts=PTS-STARTPTS[v0];'
-            f'[v0]tpad=stop_mode=clone:stop_duration={original_audio_duration}[v1];'
-            f'[0:a][1:a]concat=n=2:v=0:a=1[a]',
-            '-map', '[v1]', '-map', '[a]',
-            '-c:v', 'libx264', '-c:a', 'aac',
-            '-t', str(5 + original_audio_duration),  # Total duration
+            '-i', video_path,  # Video input
+            '-i', audio_path,  # Audio input
+            '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-movflags', '+faststart',
+            '-t', '5.0',  # Exact 5 seconds
+            '-shortest',  # Stop when shortest stream ends
             str(merged_path)
         ]
         
         result = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True, timeout=180
+            subprocess.run, cmd, capture_output=True, text=True, timeout=120
         )
         
         if result.returncode != 0:
-            logger.error(f"FFmpeg failed: {result.stderr}")
-            raise Exception(f"AI + Original audio merging failed: {result.stderr}")
+            logger.error(f"FFmpeg merge failed: {result.stderr}")
+            raise Exception(f"Video-audio merge failed: {result.stderr}")
         
-        logger.info(f"Successfully merged AI video with original audio: {merged_path}")
+        logger.info(f"Successfully merged video and audio: {merged_path}")
         return str(merged_path)
         
     except Exception as e:
-        logger.error(f"Failed to merge AI video with original audio: {e}")
-        raise Exception(f"AI + Original audio merging failed: {str(e)}")
+        logger.error(f"Failed to merge video and audio: {e}")
+        raise Exception(f"Video-audio merge failed: {str(e)}")
 
-async def _merge_final_video(first_part_path: str, second_part_path: str) -> str:
-    """Merge first part with AI+original part to create final video"""
+async def _concatenate_videos_standardized(video_paths: list) -> str:
+    """Concatenate videos with consistent encoding"""
     try:
         import subprocess
         
@@ -442,28 +465,58 @@ async def _merge_final_video(first_part_path: str, second_part_path: str) -> str
         output_id = str(uuid.uuid4())
         final_path = temp_dir / f"{output_id}_final.mp4"
         
+        # Filter out empty or very short videos
+        valid_paths = []
+        for path in video_paths:
+            if Path(path).exists():
+                # Check if video has content
+                cmd_duration = [
+                    'ffprobe', '-v', 'error', '-show_entries',
+                    'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1',
+                    path
+                ]
+                
+                result = await asyncio.to_thread(
+                    subprocess.run, cmd_duration, capture_output=True, text=True, timeout=30
+                )
+                
+                if result.returncode == 0:
+                    duration = float(result.stdout.strip())
+                    if duration > 0.1:  # At least 0.1 seconds
+                        valid_paths.append(path)
+                        logger.info(f"Including video part: {path} (duration: {duration}s)")
+                    else:
+                        logger.info(f"Skipping very short video: {path} (duration: {duration}s)")
+        
+        if not valid_paths:
+            raise Exception("No valid video parts to concatenate")
+        
         # Create concat file
         concat_file = temp_dir / f"{output_id}_concat.txt"
         with open(concat_file, 'w') as f:
-            f.write(f"file '{first_part_path}'\n")
-            f.write(f"file '{second_part_path}'\n")
+            for path in valid_paths:
+                f.write(f"file '{path}'\n")
         
-        logger.info(f"Creating final video by concatenating parts")
+        logger.info(f"Concatenating {len(valid_paths)} video parts")
         
+        # Use concat demuxer for perfect concatenation
         cmd = [
             'ffmpeg', '-y',
             '-f', 'concat', '-safe', '0', '-i', str(concat_file),
-            '-c', 'copy',
+            '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-movflags', '+faststart',
+            '-avoid_negative_ts', 'make_zero',
             str(final_path)
         ]
         
         result = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True, timeout=180
+            subprocess.run, cmd, capture_output=True, text=True, timeout=300
         )
         
         if result.returncode != 0:
-            logger.error(f"FFmpeg final merge failed: {result.stderr}")
-            raise Exception(f"Final video merge failed: {result.stderr}")
+            logger.error(f"FFmpeg concatenation failed: {result.stderr}")
+            raise Exception(f"Video concatenation failed: {result.stderr}")
         
         # Cleanup concat file
         concat_file.unlink()
@@ -472,8 +525,8 @@ async def _merge_final_video(first_part_path: str, second_part_path: str) -> str
         return str(final_path)
         
     except Exception as e:
-        logger.error(f"Failed to create final video: {e}")
-        raise Exception(f"Final video creation failed: {str(e)}")
+        logger.error(f"Failed to concatenate videos: {e}")
+        raise Exception(f"Video concatenation failed: {str(e)}")
 
 async def _upload_video_to_supabase(local_video_path: str, sender_uid: str) -> str:
     """Upload video to Supabase storage and return public URL"""
@@ -680,11 +733,11 @@ def _predict_video(image_path: str, prompt: str):
             negative_prompt="worst quality, inconsistent motion, blurry, artifacts",
             input_image_filepath=handle_file(image_path),
             input_video_filepath=None,
-            height_ui=960,
-            width_ui=544,
+            height_ui=STANDARD_HEIGHT,  # Use consistent height
+            width_ui=STANDARD_WIDTH,    # Use consistent width
             mode="image-to-video",
-            duration_ui=5,  # Changed to 5 seconds
-            ui_frames_to_use=25,  # Adjusted for 5 seconds
+            duration_ui=5,  # 5 seconds
+            ui_frames_to_use=25,  # 25 frames for 5 seconds at 5fps (AI model standard)
             seed_ui=42,
             randomize_seed=True,
             ui_guidance_scale=5,
