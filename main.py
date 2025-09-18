@@ -307,8 +307,9 @@ async def _process_video_standardized(video_path: str) -> tuple:
             '-vf', f'scale={STANDARD_WIDTH}:{STANDARD_HEIGHT}:force_original_aspect_ratio=decrease,pad={STANDARD_WIDTH}:{STANDARD_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black',
             '-r', str(STANDARD_FPS),  # Standardize FPS
             '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
-            '-c:a', 'aac', '-b:a', '128k',
+            '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',  # Standardize audio
             '-movflags', '+faststart',
+            '-avoid_negative_ts', 'make_zero',  # Fix timestamp issues
             str(first_part_path)
         ]
         
@@ -330,8 +331,9 @@ async def _process_video_standardized(video_path: str) -> tuple:
                 '-vf', f'scale={STANDARD_WIDTH}:{STANDARD_HEIGHT}:force_original_aspect_ratio=decrease,pad={STANDARD_WIDTH}:{STANDARD_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black',
                 '-r', str(STANDARD_FPS),  # Standardize FPS
                 '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
-                '-c:a', 'aac', '-b:a', '128k',
+                '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',  # Standardize audio
                 '-movflags', '+faststart',
+                '-avoid_negative_ts', 'make_zero',  # Fix timestamp issues
                 str(last_part_path)
             ]
             
@@ -344,7 +346,8 @@ async def _process_video_standardized(video_path: str) -> tuple:
         else:
             # Create empty video file if no last part exists
             cmd_empty = [
-                'ffmpeg', '-y', '-f', 'lavfi', '-i', f'color=black:size={STANDARD_WIDTH}x{STANDARD_HEIGHT}:duration=0.1:rate={STANDARD_FPS}',
+                'ffmpeg', '-y', '-f', 'lavfi', 
+                '-i', f'color=black:size={STANDARD_WIDTH}x{STANDARD_HEIGHT}:duration=0.1:rate={STANDARD_FPS}',
                 '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
                 '-c:v', 'libx264', '-c:a', 'aac', '-shortest',
                 str(last_part_path)
@@ -417,6 +420,59 @@ async def _standardize_video(video_path: str, is_ai_video: bool = False) -> str:
         logger.error(f"Failed to standardize video: {e}")
         raise Exception(f"Video standardization failed: {str(e)}")
 
+async def _repair_audio(audio_path: str) -> str:
+    """Repair and normalize potentially corrupted AI-generated audio"""
+    try:
+        import subprocess
+        
+        temp_dir = Path("/tmp")
+        repair_id = str(uuid.uuid4())
+        repaired_path = temp_dir / f"{repair_id}_repaired_audio.wav"
+        
+        logger.info(f"Repairing potentially corrupted audio: {audio_path}")
+        
+        # First, try to repair and convert to WAV (more robust format)
+        cmd_repair = [
+            'ffmpeg', '-y',
+            '-i', audio_path,
+            '-vn',  # No video
+            '-ar', '48000',  # Standard sample rate
+            '-ac', '2',  # Force stereo
+            '-c:a', 'pcm_s16le',  # Uncompressed PCM (most compatible)
+            '-af', 'aresample=48000:async=1:first_pts=0',  # Resample and fix timing
+            '-t', '5.0',  # Exact 5 seconds
+            str(repaired_path)
+        ]
+        
+        result = await asyncio.to_thread(
+            subprocess.run, cmd_repair, capture_output=True, text=True, timeout=60
+        )
+        
+        if result.returncode != 0:
+            logger.warning(f"Audio repair failed, creating silence: {result.stderr}")
+            # If repair fails, create 5 seconds of silence as fallback
+            cmd_silence = [
+                'ffmpeg', '-y',
+                '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
+                '-t', '5.0',
+                '-c:a', 'pcm_s16le',
+                str(repaired_path)
+            ]
+            
+            result = await asyncio.to_thread(
+                subprocess.run, cmd_silence, capture_output=True, text=True, timeout=30
+            )
+            
+            if result.returncode != 0:
+                raise Exception(f"Failed to create silence audio: {result.stderr}")
+        
+        logger.info(f"Audio repaired successfully: {repaired_path}")
+        return str(repaired_path)
+        
+    except Exception as e:
+        logger.error(f"Failed to repair audio: {e}")
+        raise Exception(f"Audio repair failed: {str(e)}")
+
 async def _merge_video_audio_standardized(video_path: str, audio_path: str) -> str:
     """Merge video and audio with exact duration matching"""
     try:
@@ -428,16 +484,20 @@ async def _merge_video_audio_standardized(video_path: str, audio_path: str) -> s
         
         logger.info(f"Merging video {video_path} with audio {audio_path}")
         
-        # Merge with exact 5-second duration
+        # First repair the audio to prevent corruption issues
+        repaired_audio_path = await _repair_audio(audio_path)
+        
+        # Merge with exact 5-second duration using repaired audio
         cmd = [
             'ffmpeg', '-y',
             '-i', video_path,  # Video input
-            '-i', audio_path,  # Audio input
-            '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
-            '-c:a', 'aac', '-b:a', '128k',
+            '-i', repaired_audio_path,  # Repaired audio input
+            '-c:v', 'copy',  # Copy video stream (already standardized)
+            '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',  # Standardize audio
             '-movflags', '+faststart',
             '-t', '5.0',  # Exact 5 seconds
             '-shortest',  # Stop when shortest stream ends
+            '-avoid_negative_ts', 'make_zero',  # Fix timestamp issues
             str(merged_path)
         ]
         
@@ -445,9 +505,31 @@ async def _merge_video_audio_standardized(video_path: str, audio_path: str) -> s
             subprocess.run, cmd, capture_output=True, text=True, timeout=120
         )
         
+        # Clean up repaired audio file
+        try:
+            Path(repaired_audio_path).unlink()
+        except:
+            pass
+        
         if result.returncode != 0:
             logger.error(f"FFmpeg merge failed: {result.stderr}")
-            raise Exception(f"Video-audio merge failed: {result.stderr}")
+            # If merge still fails, create video without audio
+            logger.warning("Creating video without AI audio due to corruption")
+            cmd_no_audio = [
+                'ffmpeg', '-y',
+                '-i', video_path,
+                '-c:v', 'copy',
+                '-an',  # No audio
+                '-t', '5.0',
+                str(merged_path)
+            ]
+            
+            result = await asyncio.to_thread(
+                subprocess.run, cmd_no_audio, capture_output=True, text=True, timeout=60
+            )
+            
+            if result.returncode != 0:
+                raise Exception(f"Failed to create video even without audio: {result.stderr}")
         
         logger.info(f"Successfully merged video and audio: {merged_path}")
         return str(merged_path)
@@ -736,7 +818,7 @@ def _predict_video(image_path: str, prompt: str):
             height_ui=STANDARD_HEIGHT,  # Use consistent height
             width_ui=STANDARD_WIDTH,    # Use consistent width
             mode="image-to-video",
-            duration_ui=5,  # 5 seconds
+            duration_ui=2,  # 5 seconds
             ui_frames_to_use=25,  # 25 frames for 5 seconds at 5fps (AI model standard)
             seed_ui=42,
             randomize_seed=True,
@@ -755,7 +837,7 @@ def _predict_audio(prompt: str):
         
         result = audio_client.predict(
             prompt=prompt,
-            duration=5,  # 5 seconds
+            duration=2,  # 5 seconds
             cfg_strength=4.5,
             num_steps=1,
             variant="meanaudio_s_full",
@@ -764,11 +846,196 @@ def _predict_audio(prompt: str):
         )
         
         logger.info(f"Audio generation result: {result}")
-        return result[0]  # Return the first element (filepath) from the tuple
+        
+        # Validate the result
+        if not result or len(result) == 0:
+            logger.warning("Audio generation returned empty result")
+            return None
+            
+        audio_path = result[0]  # Return the first element (filepath) from the tuple
+        
+        # Check if the audio file actually exists and has content
+        if not audio_path or not Path(audio_path).exists():
+            logger.warning(f"Audio file does not exist: {audio_path}")
+            return None
+            
+        # Check if audio file has reasonable size (at least 1KB)
+        if Path(audio_path).stat().st_size < 1024:
+            logger.warning(f"Audio file is too small: {Path(audio_path).stat().st_size} bytes")
+            return None
+            
+        return audio_path
         
     except Exception as e:
         logger.error(f"Audio Gradio client prediction failed: {e}")
+        return None  # Return None instead of raising, so we can handle gracefully
+
+async def generate_video(
+    file: UploadFile = File(...),
+    prompt: str = Form(...),
+    sender_uid: str = Form(...),
+    receiver_uids: str = Form(...)
+):
+    """Generate video from video input and prompt, add audio, then merge them"""
+    temp_files = []  # Track all temp files for cleanup
+
+    try:
+        # Improved video validation
+        content_type = file.content_type or ""
+        filename = file.filename or ""
+
+        # Check content type OR file extension for video
+        valid_content_types = ['video/mp4', 'video/mov', 'video/avi', 'video/webm', 'video/quicktime']
+        valid_extensions = ['.mp4', '.mov', '.avi', '.webm', '.qt']
+
+        is_valid_content_type = any(content_type.startswith(ct) for ct in valid_content_types)
+        is_valid_extension = any(filename.lower().endswith(ext) for ext in valid_extensions)
+
+        if not (is_valid_content_type or is_valid_extension):
+            logger.warning(f"Invalid file - Content-Type: {content_type}, Filename: {filename}")
+            raise HTTPException(status_code=400, detail="File must be a video (mp4, mov, avi, webm)")
+
+        if len(prompt.strip()) == 0:
+            raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+        logger.info(f"Starting video generation for user {sender_uid}")
+        logger.info(f"Prompt: {prompt}")
+        logger.info(f"Receivers: {receiver_uids}")
+
+        # Create temp directory if it doesn't exist
+        temp_dir = Path("/tmp")
+        temp_dir.mkdir(exist_ok=True)
+
+        # Save uploaded video temporarily
+        video_id = str(uuid.uuid4())
+        file_extension = Path(filename).suffix or '.mp4'
+        temp_video_path = temp_dir / f"{video_id}{file_extension}"
+        temp_files.append(temp_video_path)
+
+        # Save file
+        with open(temp_video_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+
+        logger.info(f"Video saved to {temp_video_path}")
+
+        # Validate file size (optional)
+        file_size = temp_video_path.stat().st_size
+        if file_size > 50 * 1024 * 1024:  # 50MB limit for videos
+            raise HTTPException(status_code=400, detail="File too large (max 50MB)")
+
+        # Check if clients are available
+        if client is None:
+            raise HTTPException(status_code=503, detail="AI video service not available")
+        
+        if audio_client is None:
+            raise HTTPException(status_code=503, detail="AI audio service not available")
+
+        if supabase is None:
+            raise HTTPException(status_code=503, detail="Storage service not available")
+
+        # Process video with standardized parameters
+        logger.info("Processing video: extracting middle frame and splitting...")
+        middle_frame_path, first_part_path, last_part_path = await _process_video_standardized(str(temp_video_path))
+        temp_files.extend([middle_frame_path, first_part_path, last_part_path])
+
+        # Start both AI video and AI audio generation concurrently
+        logger.info("Starting AI video and audio generation concurrently...")
+        
+        # Create tasks for both generations
+        ai_video_task = asyncio.create_task(
+            asyncio.wait_for(
+                asyncio.to_thread(_predict_video, middle_frame_path, prompt),
+                timeout=300.0  # 5 minutes timeout
+            )
+        )
+
+        ai_audio_task = asyncio.create_task(
+            asyncio.wait_for(
+                asyncio.to_thread(_predict_audio, prompt),
+                timeout=300.0  # 5 minutes timeout
+            )
+        )
+
+        # Wait for both tasks to complete
+        ai_video_result, ai_audio_result = await asyncio.gather(ai_video_task, ai_audio_task)
+
+        if not ai_video_result or len(ai_video_result) < 2:
+            raise HTTPException(status_code=500, detail="Invalid response from video AI model")
+
+        # Handle audio failure gracefully
+        if not ai_audio_result:
+            logger.warning("AI audio generation failed, proceeding without AI audio")
+
+        ai_video_path = ai_video_result[0].get("video") if isinstance(ai_video_result[0], dict) else ai_video_result[0]
+        seed_used = ai_video_result[1] if len(ai_video_result) > 1 else "unknown"
+
+        logger.info(f"AI Video generated locally: {ai_video_path}")
+        logger.info(f"AI Audio result: {ai_audio_result}")
+
+        # Standardize AI video to match our requirements
+        ai_video_standardized = await _standardize_video(ai_video_path, is_ai_video=True)
+        temp_files.append(ai_video_standardized)
+
+        # Merge AI video with AI audio (if available)
+        if ai_audio_result:
+            ai_merged_path = await _merge_video_audio_standardized(ai_video_standardized, ai_audio_result)
+            temp_files.append(ai_merged_path)
+            logger.info(f"AI video and audio merged: {ai_merged_path}")
+        else:
+            # Use AI video without audio if audio generation failed
+            ai_merged_path = ai_video_standardized
+            logger.info(f"Using AI video without audio due to audio generation failure")
+
+        # Create final video by concatenating all three parts
+        final_video_path = await _concatenate_videos_standardized([first_part_path, ai_merged_path, last_part_path])
+        temp_files.append(final_video_path)
+        logger.info(f"Final video created: {final_video_path}")
+
+        # Upload final video to Supabase storage
+        video_url = await _upload_video_to_supabase(final_video_path, sender_uid)
+        logger.info(f"Final video uploaded to Supabase: {video_url}")
+
+        # Save chat messages to Firebase for each receiver
+        receiver_list = [uid.strip() for uid in receiver_uids.split(",") if uid.strip()]
+        await _save_chat_messages_to_firebase(sender_uid, receiver_list, video_url, prompt)
+
+        return JSONResponse({
+            "success": True,
+            "video_url": video_url,
+            "seed": seed_used,
+            "sender_uid": sender_uid,
+            "receiver_uids": receiver_list,
+            "has_ai_audio": ai_audio_result is not None
+        })
+
+    except asyncio.TimeoutError:
+        logger.error("AI Video/Audio generation timed out after 5 minutes")
+        raise HTTPException(
+            status_code=408, 
+            detail="AI Video/Audio generation timed out. Please try with a simpler prompt or smaller video."
+        )
+
+    except HTTPException:
+        # Re-raise HTTP exceptions
         raise
+
+    except Exception as e:
+        logger.error(f"Error generating video: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate video: {str(e)}"
+        )
+
+    finally:
+        # Cleanup temporary files
+        for temp_path in temp_files:
+            if temp_path and Path(temp_path).exists():
+                try:
+                    Path(temp_path).unlink()
+                    logger.info(f"Cleaned up temp file: {temp_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup temp file {temp_path}: {e}")
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
