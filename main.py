@@ -357,8 +357,19 @@ async def _stitch_final_video(first_half_path: str, generated_video_path: str,
         if probe_result.returncode != 0:
             raise Exception(f"Failed to probe original video: {probe_result.stderr}")
         
-        lines = probe_result.stdout.strip().split('\n')
-        original_fps, original_width, original_height = lines[0].split(',')
+        # Fix: Handle the probe output more carefully
+        output_lines = probe_result.stdout.strip().split('\n')
+        if not output_lines or not output_lines[0]:
+            raise Exception("No video stream information found")
+        
+        # Parse the first line which should contain fps,width,height
+        video_info = output_lines[0].split(',')
+        if len(video_info) < 3:
+            raise Exception(f"Unexpected probe output format: {output_lines[0]}")
+        
+        original_fps = video_info[0]
+        original_width = video_info[1] 
+        original_height = video_info[2]
         
         logger.info(f"Original video properties: {original_width}x{original_height} @ {original_fps} fps")
         
