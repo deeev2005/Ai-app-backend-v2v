@@ -669,7 +669,7 @@ def _predict_video(image_path: str, prompt: str):
             height_ui=960,
             width_ui=544,
             mode="image-to-video",
-            duration_ui=5,  # Changed to 5 seconds
+            duration_ui=3,  # Changed to 5 seconds
             ui_frames_to_use=9,
             seed_ui=42,
             randomize_seed=True,
@@ -688,7 +688,7 @@ def _predict_audio(prompt: str):
         
         result = audio_client.predict(
             prompt=prompt,
-            duration=5,  # 5 seconds to match video
+            duration=3,  # 5 seconds to match video
             cfg_strength=4.5,
             num_steps=1,
             variant="meanaudio_s_full",
