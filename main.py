@@ -342,54 +342,108 @@ async def _stitch_final_video(first_half_path: str, generated_video_path: str,
         temp_dir = Path("/tmp")
         output_id = str(uuid.uuid4())
         
-        # Step 1: Add generated audio to generated video
-        generated_with_audio_path = temp_dir / f"{output_id}_generated_with_audio.mp4"
+        # First, get the frame rate and resolution of the original video
+        probe_cmd = [
+            'ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
+            '-show_entries', 'stream=r_frame_rate,width,height',
+            '-of', 'csv=p=0', first_half_path
+        ]
         
-        merge_generated_cmd = [
+        probe_result = await asyncio.to_thread(
+            subprocess.run, probe_cmd, 
+            capture_output=True, text=True, timeout=30
+        )
+        
+        if probe_result.returncode != 0:
+            raise Exception(f"Failed to probe original video: {probe_result.stderr}")
+        
+        lines = probe_result.stdout.strip().split('\n')
+        original_fps, original_width, original_height = lines[0].split(',')
+        
+        logger.info(f"Original video properties: {original_width}x{original_height} @ {original_fps} fps")
+        
+        # Step 1: Normalize all video segments to match original specs
+        normalized_first_path = temp_dir / f"{output_id}_normalized_first.mp4"
+        normalized_generated_path = temp_dir / f"{output_id}_normalized_generated.mp4"
+        normalized_second_path = temp_dir / f"{output_id}_normalized_second.mp4"
+        
+        # Normalize first half (should already match, but ensure consistency)
+        norm_first_cmd = [
+            'ffmpeg', '-y',
+            '-i', first_half_path,
+            '-vf', f'scale={original_width}:{original_height}',
+            '-r', str(eval(original_fps)),  # Convert fraction to decimal
+            '-c:v', 'libx264', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k',
+            str(normalized_first_path)
+        ]
+        
+        # Normalize generated video and add audio - this is the key fix
+        norm_generated_cmd = [
             'ffmpeg', '-y',
             '-i', generated_video_path,
             '-i', generated_audio_path,
-            '-c:v', 'copy',
-            '-c:a', 'aac',
+            '-vf', f'scale={original_width}:{original_height}',
+            '-r', str(eval(original_fps)),  # Match original fps
+            '-t', '5.0',  # Force exactly 5 seconds
+            '-c:v', 'libx264', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k',
             '-shortest',
-            str(generated_with_audio_path)
+            str(normalized_generated_path)
         ]
         
-        result1 = await asyncio.to_thread(
-            subprocess.run, merge_generated_cmd, 
-            capture_output=True, text=True, timeout=120
-        )
+        # Normalize second half
+        norm_second_cmd = [
+            'ffmpeg', '-y',
+            '-i', second_half_path,
+            '-vf', f'scale={original_width}:{original_height}',
+            '-r', str(eval(original_fps)),
+            '-c:v', 'libx264', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k',
+            str(normalized_second_path)
+        ]
         
-        if result1.returncode != 0:
-            raise Exception(f"Failed to merge generated video with audio: {result1.stderr}")
+        # Run normalization commands
+        norm_tasks = [
+            asyncio.to_thread(subprocess.run, norm_first_cmd, capture_output=True, text=True, timeout=120),
+            asyncio.to_thread(subprocess.run, norm_generated_cmd, capture_output=True, text=True, timeout=120),
+            asyncio.to_thread(subprocess.run, norm_second_cmd, capture_output=True, text=True, timeout=120)
+        ]
         
-        # Step 2: Create list file for concatenation
-        concat_list_path = temp_dir / f"{output_id}_concat_list.txt"
+        norm_results = await asyncio.gather(*norm_tasks)
         
-        with open(concat_list_path, 'w') as f:
-            f.write(f"file '{first_half_path}'\n")
-            f.write(f"file '{generated_with_audio_path}'\n")
-            f.write(f"file '{second_half_path}'\n")
+        # Check normalization results
+        for i, result in enumerate(norm_results):
+            if result.returncode != 0:
+                segment_names = ["first half", "generated", "second half"]
+                logger.error(f"Normalization failed for {segment_names[i]}: {result.stderr}")
+                raise Exception(f"Failed to normalize {segment_names[i]}: {result.stderr}")
         
-        # Step 3: Concatenate all parts
+        # Step 2: Concatenate normalized segments
         final_output_path = temp_dir / f"{output_id}_final.mp4"
         
+        # Use filter_complex for seamless concatenation
         concat_cmd = [
             'ffmpeg', '-y',
-            '-f', 'concat',
-            '-safe', '0',
-            '-i', str(concat_list_path),
-            '-c', 'copy',
+            '-i', str(normalized_first_path),
+            '-i', str(normalized_generated_path),
+            '-i', str(normalized_second_path),
+            '-filter_complex', '[0:v][0:a][1:v][1:a][2:v][2:a]concat=n=3:v=1:a=1[outv][outa]',
+            '-map', '[outv]',
+            '-map', '[outa]',
+            '-c:v', 'libx264', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k',
             str(final_output_path)
         ]
         
-        result2 = await asyncio.to_thread(
+        result = await asyncio.to_thread(
             subprocess.run, concat_cmd, 
-            capture_output=True, text=True, timeout=180
+            capture_output=True, text=True, timeout=240
         )
         
-        if result2.returncode != 0:
-            raise Exception(f"Failed to concatenate video parts: {result2.stderr}")
+        if result.returncode != 0:
+            logger.error(f"Concatenation failed: {result.stderr}")
+            raise Exception(f"Failed to concatenate video segments: {result.stderr}")
         
         if not final_output_path.exists():
             raise Exception("Final stitched video file was not created")
@@ -397,7 +451,7 @@ async def _stitch_final_video(first_half_path: str, generated_video_path: str,
         logger.info(f"Successfully stitched final video: {final_output_path}")
         
         # Cleanup intermediate files
-        for cleanup_path in [generated_with_audio_path, concat_list_path]:
+        for cleanup_path in [normalized_first_path, normalized_generated_path, normalized_second_path]:
             if cleanup_path.exists():
                 cleanup_path.unlink()
         
