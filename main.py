@@ -289,6 +289,7 @@ async def _process_video_standardized(video_path: str) -> tuple:
             'ffmpeg', '-y', '-i', video_path,
             '-ss', str(middle_time), '-vframes', '1',
             '-vf', f'scale={STANDARD_WIDTH}:{STANDARD_HEIGHT}:force_original_aspect_ratio=decrease,pad={STANDARD_WIDTH}:{STANDARD_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black',
+            '-q:v', '2',
             str(middle_frame_path)
         ]
         
@@ -821,8 +822,8 @@ def _predict_video(image_path: str, prompt: str):
             duration_ui=2,  # 5 seconds
             ui_frames_to_use=25,  # 25 frames for 5 seconds at 5fps (AI model standard)
             seed_ui=42,
-            randomize_seed=True,
-            ui_guidance_scale=5,
+            randomize_seed=False,
+            ui_guidance_scale=8,
             improve_texture_flag=True,
             api_name="/image_to_video"
         )
