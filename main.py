@@ -810,7 +810,7 @@ async def _save_chat_messages_to_firebase(sender_uid: str, receiver_list: list, 
 def _predict_video(image_path: str, prompt: str):
     """Synchronous function to call the Gradio client for 5-second video"""
     try:
-        enhanced_prompt = f"{prompt} do not change the face of the person, do not change the face"
+        enhanced_prompt = f"{prompt} do not change the face of the person, do not change the face, keep the face clear"
         return client.predict(
             prompt=enhanced_prompt,
             negative_prompt="worst quality, inconsistent motion, blurry face, artifacts,distorted face,distorted video,distorted motion,blurry video,blur face,changed face,new face,changed facial appearance",
