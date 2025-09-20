@@ -821,7 +821,7 @@ def _predict_video(image_path: str, prompt: str):
             width_ui=STANDARD_WIDTH,    # Use consistent width
             mode="image-to-video",
             duration_ui=2,  # 5 seconds
-            ui_frames_to_use=5,  # 25 frames for 5 seconds at 5fps (AI model standard)
+            ui_frames_to_use=30,  # 25 frames for 5 seconds at 5fps (AI model standard)
             seed_ui=42,
             randomize_seed=True,
             ui_guidance_scale=5,
