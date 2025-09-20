@@ -288,7 +288,7 @@ async def _process_video_standardized(video_path: str) -> tuple:
         cmd_frame = [
             'ffmpeg', '-y', '-i', video_path,
             '-ss', str(middle_time), '-vframes', '1',
-            '-vf', 'unsharp=5:5:1.0:5:5:0.0,hqdn3d=2:1:2',
+            
             '-f', 'image2',  # Specify image format
             '-pix_fmt', 'rgb24',  # Use RGB pixel format
             str(middle_frame_path)
