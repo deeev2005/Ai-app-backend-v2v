@@ -811,8 +811,9 @@ def _predict_video(image_path: str, prompt: str):
     """Synchronous function to call the Gradio client for 5-second video"""
     try:
         return client.predict(
-            prompt=prompt,
-            negative_prompt="worst quality, inconsistent motion, blurry face, artifacts,distorted face,distorted video,distorted motion,blurry video,blur face,changed face",
+            enhanced_prompt = f"{prompt} do not change the face of the person, do not change the face",
+            prompt=enhanced_prompt,
+            negative_prompt="worst quality, inconsistent motion, blurry face, artifacts,distorted face,distorted video,distorted motion,blurry video,blur face,changed face,new face,changed facial appearance",
             input_image_filepath=handle_file(image_path),
             input_video_filepath=None,
             height_ui=STANDARD_HEIGHT,  # Use consistent height
@@ -822,7 +823,7 @@ def _predict_video(image_path: str, prompt: str):
             ui_frames_to_use=25,  # 25 frames for 5 seconds at 5fps (AI model standard)
             seed_ui=42,
             randomize_seed=True,
-            ui_guidance_scale=5,
+            ui_guidance_scale=6,
             improve_texture_flag=True,
             api_name="/image_to_video"
         )
