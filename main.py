@@ -80,6 +80,21 @@ async def health_check():
         "supabase_ready": supabase is not None
     }
 
+def parse_prompt(prompt: str):
+    """Parse prompt to extract magic prompt and caption"""
+    if "!@#" not in prompt:
+        return prompt.strip(), None
+    
+    parts = prompt.split("!@#", 1)
+    magic_prompt = parts[0].strip()
+    caption = parts[1].strip() if len(parts) > 1 else None
+    
+    # Replace ^ with empty string
+    magic_prompt = magic_prompt if magic_prompt != "^" else ""
+    caption = caption if caption != "^" else None
+    
+    return magic_prompt, caption
+
 @app.post("/generate/")
 async def generate_video(
     file: UploadFile = File(...),
@@ -91,6 +106,14 @@ async def generate_video(
     temp_files = []  # Track all temp files for cleanup
 
     try:
+        # Parse the prompt to extract magic prompt and caption
+        magic_prompt, caption = parse_prompt(prompt)
+        
+        logger.info(f"Parsed prompt - Magic: '{magic_prompt}', Caption: '{caption}'")
+        
+        # Determine if we should skip API processing
+        skip_api = (magic_prompt == "" or magic_prompt is None)
+        
         # Improved video validation
         content_type = file.content_type or ""
         filename = file.filename or ""
@@ -106,11 +129,9 @@ async def generate_video(
             logger.warning(f"Invalid file - Content-Type: {content_type}, Filename: {filename}")
             raise HTTPException(status_code=400, detail="File must be a video (mp4, mov, avi, webm)")
 
-        if len(prompt.strip()) == 0:
-            raise HTTPException(status_code=400, detail="Prompt cannot be empty")
-
-        logger.info(f"Starting video generation for user {sender_uid}")
-        logger.info(f"Prompt: {prompt}")
+        logger.info(f"Starting processing for user {sender_uid}")
+        logger.info(f"Original Prompt: {prompt}")
+        logger.info(f"Skip API: {skip_api}")
         logger.info(f"Receivers: {receiver_uids}")
 
         # Create temp directory if it doesn't exist
@@ -135,88 +156,98 @@ async def generate_video(
         if file_size > 50 * 1024 * 1024:  # 50MB limit for videos
             raise HTTPException(status_code=400, detail="File too large (max 50MB)")
 
-        # Check if clients are available
-        if client is None:
-            raise HTTPException(status_code=503, detail="AI video service not available")
-        
-        if audio_client is None:
-            raise HTTPException(status_code=503, detail="AI audio service not available")
-
+        # Check if Supabase is available
         if supabase is None:
             raise HTTPException(status_code=503, detail="Storage service not available")
 
-        # Process video with new structure: first_part + middle_frame + ai_video + last_part
-        logger.info("Processing video: extracting parts with middle frame...")
-        middle_frame_path, first_part_path, middle_frame_video_path, ai_video_duration, remaining_audio_path = await _process_video_with_middle_frame(str(temp_video_path))
-        temp_files.extend([middle_frame_path, first_part_path, middle_frame_video_path, remaining_audio_path])
-
-        # Start both AI video and AI audio generation concurrently
-        logger.info("Starting AI video and audio generation concurrently...")
+        video_url = None
         
-        # Create tasks for both generations
-        ai_video_task = asyncio.create_task(
-            asyncio.wait_for(
-                asyncio.to_thread(_predict_video, middle_frame_path, prompt),
-                timeout=300.0  # 5 minutes timeout
+        if skip_api:
+            # Skip API processing, upload video directly to Supabase
+            logger.info("Skipping API processing, uploading video directly to Supabase")
+            video_url = await _upload_video_to_supabase(str(temp_video_path), sender_uid)
+            logger.info(f"Video uploaded to Supabase: {video_url}")
+        else:
+            # Process with API
+            # Check if clients are available
+            if client is None:
+                raise HTTPException(status_code=503, detail="AI video service not available")
+            
+            if audio_client is None:
+                raise HTTPException(status_code=503, detail="AI audio service not available")
+
+            # Process video with new structure: first_part + middle_frame + ai_video + last_part
+            logger.info("Processing video: extracting parts with middle frame...")
+            middle_frame_path, first_part_path, middle_frame_video_path, ai_video_duration, remaining_audio_path = await _process_video_with_middle_frame(str(temp_video_path))
+            temp_files.extend([middle_frame_path, first_part_path, middle_frame_video_path, remaining_audio_path])
+
+            # Start both AI video and AI audio generation concurrently
+            logger.info("Starting AI video and audio generation concurrently...")
+            
+            # Create tasks for both generations
+            ai_video_task = asyncio.create_task(
+                asyncio.wait_for(
+                    asyncio.to_thread(_predict_video, middle_frame_path, magic_prompt),
+                    timeout=300.0  # 5 minutes timeout
+                )
             )
-        )
 
-        ai_audio_task = asyncio.create_task(
-            asyncio.wait_for(
-                asyncio.to_thread(_predict_audio, prompt),
-                timeout=300.0  # 5 minutes timeout
+            ai_audio_task = asyncio.create_task(
+                asyncio.wait_for(
+                    asyncio.to_thread(_predict_audio, magic_prompt),
+                    timeout=300.0  # 5 minutes timeout
+                )
             )
-        )
 
-        # Wait for both tasks to complete
-        ai_video_result, ai_audio_result = await asyncio.gather(ai_video_task, ai_audio_task)
+            # Wait for both tasks to complete
+            ai_video_result, ai_audio_result = await asyncio.gather(ai_video_task, ai_audio_task)
 
-        if not ai_video_result or len(ai_video_result) < 2:
-            raise HTTPException(status_code=500, detail="Invalid response from video AI model")
+            if not ai_video_result or len(ai_video_result) < 2:
+                raise HTTPException(status_code=500, detail="Invalid response from video AI model")
 
-        # Handle audio failure gracefully
-        if not ai_audio_result:
-            logger.warning("AI audio generation failed, will use only original audio")
+            # Handle audio failure gracefully
+            if not ai_audio_result:
+                logger.warning("AI audio generation failed, will use only original audio")
 
-        ai_video_path = ai_video_result[0].get("video") if isinstance(ai_video_result[0], dict) else ai_video_result[0]
-        seed_used = ai_video_result[1] if len(ai_video_result) > 1 else "unknown"
+            ai_video_path = ai_video_result[0].get("video") if isinstance(ai_video_result[0], dict) else ai_video_result[0]
+            seed_used = ai_video_result[1] if len(ai_video_result) > 1 else "unknown"
 
-        logger.info(f"AI Video generated locally: {ai_video_path}")
-        logger.info(f"AI Audio result: {ai_audio_result}")
+            logger.info(f"AI Video generated locally: {ai_video_path}")
+            logger.info(f"AI Audio result: {ai_audio_result}")
 
-        # Standardize AI video to match our requirements
-        ai_video_standardized = await _standardize_video(ai_video_path, is_ai_video=True)
-        temp_files.append(ai_video_standardized)
+            # Standardize AI video to match our requirements
+            ai_video_standardized = await _standardize_video(ai_video_path, is_ai_video=True)
+            temp_files.append(ai_video_standardized)
 
-        # Create mixed audio for AI video section (AI audio + original remaining audio)
-        mixed_audio_path = await _create_mixed_audio(ai_audio_result, remaining_audio_path, ai_video_duration)
-        temp_files.append(mixed_audio_path)
+            # Create mixed audio for AI video section (AI audio + original remaining audio)
+            mixed_audio_path = await _create_mixed_audio(ai_audio_result, remaining_audio_path, ai_video_duration)
+            temp_files.append(mixed_audio_path)
 
-        # Merge AI video with mixed audio
-        ai_merged_path = await _merge_video_audio_standardized(ai_video_standardized, mixed_audio_path)
-        temp_files.append(ai_merged_path)
-        logger.info(f"AI video merged with mixed audio: {ai_merged_path}")
+            # Merge AI video with mixed audio
+            ai_merged_path = await _merge_video_audio_standardized(ai_video_standardized, mixed_audio_path)
+            temp_files.append(ai_merged_path)
+            logger.info(f"AI video merged with mixed audio: {ai_merged_path}")
 
-        # Create final video by concatenating all four parts: first_part + middle_frame + ai_video + (remaining original video handled in first_part)
-        final_video_path = await _concatenate_videos_standardized([first_part_path, middle_frame_video_path, ai_merged_path])
-        temp_files.append(final_video_path)
-        logger.info(f"Final video created: {final_video_path}")
+            # Create final video by concatenating all four parts: first_part + middle_frame + ai_video + (remaining original video handled in first_part)
+            final_video_path = await _concatenate_videos_standardized([first_part_path, middle_frame_video_path, ai_merged_path])
+            temp_files.append(final_video_path)
+            logger.info(f"Final video created: {final_video_path}")
 
-        # Upload final video to Supabase storage
-        video_url = await _upload_video_to_supabase(final_video_path, sender_uid)
-        logger.info(f"Final video uploaded to Supabase: {video_url}")
+            # Upload final video to Supabase storage
+            video_url = await _upload_video_to_supabase(final_video_path, sender_uid)
+            logger.info(f"Final video uploaded to Supabase: {video_url}")
 
         # Save chat messages to Firebase for each receiver
         receiver_list = [uid.strip() for uid in receiver_uids.split(",") if uid.strip()]
-        await _save_chat_messages_to_firebase(sender_uid, receiver_list, video_url, prompt)
+        await _save_chat_messages_to_firebase(sender_uid, receiver_list, video_url, magic_prompt or "", caption, skip_api)
 
         return JSONResponse({
             "success": True,
             "video_url": video_url,
-            "seed": seed_used,
             "sender_uid": sender_uid,
             "receiver_uids": receiver_list,
-            "has_ai_audio": ai_audio_result is not None
+            "caption": caption,
+            "skipped_api": skip_api
         })
 
     except asyncio.TimeoutError:
@@ -776,7 +807,7 @@ async def _upload_video_to_supabase(local_video_path: str, sender_uid: str) -> s
         logger.error(f"Failed to upload video to Supabase: {e}")
         raise Exception(f"Storage upload failed: {str(e)}")
 
-async def _save_chat_messages_to_firebase(sender_uid: str, receiver_list: list, video_url: str, prompt: str):
+async def _save_chat_messages_to_firebase(sender_uid: str, receiver_list: list, video_url: str, prompt: str, caption: str, is_video_only: bool):
     """Save chat messages with video URL to Firebase for each receiver"""
     try:
         import firebase_admin
@@ -828,6 +859,10 @@ async def _save_chat_messages_to_firebase(sender_uid: str, receiver_list: list, 
                         "mediaType": "video",
                         "videoStatus": "uploaded"
                     }
+                    
+                    # Add caption field if caption exists
+                    if caption:
+                        group_message_data["caption"] = caption
 
                     # Save to groups/{group_id}/messages/ (without "(group)" in the path)
                     doc_ref = db.collection("groups").document(group_id).collection("messages").add(group_message_data)
@@ -850,6 +885,10 @@ async def _save_chat_messages_to_firebase(sender_uid: str, receiver_list: list, 
                         "mediaType": "video",
                         "videoStatus": "uploaded"
                     }
+                    
+                    # Add caption field if caption exists
+                    if caption:
+                        message_data["caption"] = caption
 
                     # Save message to chats/{receiver_id}/messages/ collection
                     doc_ref = db.collection("chats").document(receiver_id).collection("messages").add(message_data)
@@ -880,6 +919,10 @@ async def _save_chat_messages_to_firebase(sender_uid: str, receiver_list: list, 
                             receiver_id: firestore.Increment(1)
                         }
                     }
+                    
+                    # Add caption to chat data if it exists
+                    if caption:
+                        chat_data["lastCaption"] = caption
 
                     # Create chat if it doesn't exist, or update if it does
                     chat_ref = db.collection("chats").document(chat_id)
@@ -899,6 +942,11 @@ async def _save_chat_messages_to_firebase(sender_uid: str, receiver_list: list, 
                             "updatedAt": timestamp,
                             f"unreadCount.{receiver_id}": firestore.Increment(1)
                         }
+                        
+                        # Add caption to update if it exists
+                        if caption:
+                            update_data["lastCaption"] = caption
+                        
                         chat_ref.update(update_data)
                         logger.info(f"Updated existing chat with video: {chat_id}")
                     else:
