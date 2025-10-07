@@ -1003,7 +1003,7 @@ def _predict_audio(prompt: str):
             prompt=prompt,
             duration=2,  # 5 seconds
             cfg_strength=4.5,
-            num_steps=1,
+            num_steps=3,
             variant="meanaudio_s_full",
             seed=42,
             api_name="/predict"
