@@ -11,6 +11,7 @@ from gradio_client import Client, handle_file
 from dotenv import load_dotenv
 from supabase import create_client, Client as SupabaseClient
 import uvicorn
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -51,16 +52,55 @@ STANDARD_WIDTH = 544
 STANDARD_HEIGHT = 960
 STANDARD_FPS = 24  # Use 24fps as standard (works well for most content)
 
+def initialize_gradio_client_with_retry(space_name: str, max_retries: int = 5, initial_delay: float = 2.0):
+    """Initialize Gradio client with exponential backoff retry logic"""
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to initialize Gradio client for {space_name} (attempt {attempt + 1}/{max_retries})...")
+            
+            # Add headers to force full content response
+            client = Client(
+                space_name, 
+                token=HF_TOKEN, 
+                httpx_kwargs={
+                    "timeout": 3000.0,
+                    "headers": {
+                        "Range": None,  # Prevent partial content requests
+                        "Accept": "application/json"
+                    }
+                }
+            )
+            
+            logger.info(f"Successfully initialized Gradio client for {space_name}")
+            return client
+            
+        except Exception as e:
+            logger.warning(f"Attempt {attempt + 1} failed for {space_name}: {e}")
+            
+            if attempt < max_retries - 1:
+                delay = initial_delay * (2 ** attempt)  # Exponential backoff
+                logger.info(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(f"All {max_retries} attempts failed for {space_name}")
+                raise
+
 @app.on_event("startup")
 async def startup_event():
     global client, audio_client, supabase
     try:
-        logger.info("Initializing Gradio client...")
-        client = Client("Heartsync/wan2_2-I2V-14B-FAST", token=HF_TOKEN, httpx_kwargs={"timeout": 3000.0})
-        logger.info("Gradio client initialized successfully")
-
+        # Initialize video client with retry logic
+        client = await asyncio.to_thread(
+            initialize_gradio_client_with_retry,
+            "Heartsync/wan2_2-I2V-14B-FAST"
+        )
+        
+        # Initialize audio client with retry logic
         logger.info("Initializing Audio Gradio client...")
-        audio_client = Client("chenxie95/MeanAudio", token=HF_TOKEN, httpx_kwargs={"timeout": 3000.0})
+        audio_client = await asyncio.to_thread(
+            initialize_gradio_client_with_retry,
+            "chenxie95/MeanAudio"
+        )
         logger.info("Audio Gradio client initialized successfully")
         
         logger.info("Initializing Supabase client...")
