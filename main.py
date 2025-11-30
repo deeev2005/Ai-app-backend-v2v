@@ -56,11 +56,11 @@ async def startup_event():
     global client, audio_client, supabase
     try:
         logger.info("Initializing Gradio client...")
-        client = Client("Lightricks/ltx-video-distilled", hf_token=HF_TOKEN)
+        client = Client("Heartsync/wan2_2-I2V-14B-FAST", token=HF_TOKEN)
         logger.info("Gradio client initialized successfully")
 
         logger.info("Initializing Audio Gradio client...")
-        audio_client = Client("chenxie95/MeanAudio", hf_token=HF_TOKEN)
+        audio_client = Client("chenxie95/MeanAudio", token=HF_TOKEN)
         logger.info("Audio Gradio client initialized successfully")
         
         logger.info("Initializing Supabase client...")
@@ -315,7 +315,7 @@ async def _process_video_with_middle_frame(video_path: str) -> tuple:
         
         # Calculate split points
         middle_time = duration / 2
-        ai_duration = 5.0  # AI video is exactly 5 seconds
+        ai_duration = 3.5  # AI video is 3.5 seconds (changed from 5.0)
         
         logger.info(f"Split points - Middle: {middle_time}s, AI duration: {ai_duration}s")
         
@@ -408,9 +408,7 @@ async def _process_video_with_middle_frame(video_path: str) -> tuple:
                     '-t', str(ai_duration),
                     '-c:a', 'pcm_s16le',
                     str(remaining_audio_path)
-                ]
-                
-                result = await asyncio.to_thread(
+                ]result = await asyncio.to_thread(
                     subprocess.run, cmd_silence, capture_output=True, text=True, timeout=30
                 )
                 
@@ -545,7 +543,7 @@ async def _standardize_video(video_path: str, is_ai_video: bool = False) -> str:
                 '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
                 '-c:a', 'aac', '-b:a', '128k',
                 '-movflags', '+faststart',
-                '-t', '5.0',  # Ensure exactly 5 seconds
+                '-t', '3.5',  # Ensure exactly 3.5 seconds
                 str(standardized_path)
             ]
         else:
@@ -595,7 +593,7 @@ async def _repair_audio(audio_path: str) -> str:
             '-ac', '2',  # Force stereo
             '-c:a', 'pcm_s16le',  # Uncompressed PCM (most compatible)
             '-af', 'aresample=48000:async=1:first_pts=0',  # Resample and fix timing
-            '-t', '5.0',  # Exact 5 seconds
+            '-t', '3.5',  # Exact 3.5 seconds
             str(repaired_path)
         ]
         
@@ -605,11 +603,11 @@ async def _repair_audio(audio_path: str) -> str:
         
         if result.returncode != 0:
             logger.warning(f"Audio repair failed, creating silence: {result.stderr}")
-            # If repair fails, create 5 seconds of silence as fallback
+            # If repair fails, create 3.5 seconds of silence as fallback
             cmd_silence = [
                 'ffmpeg', '-y',
                 '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
-                '-t', '5.0',
+                '-t', '3.5',
                 '-c:a', 'pcm_s16le',
                 str(repaired_path)
             ]
@@ -639,7 +637,7 @@ async def _merge_video_audio_standardized(video_path: str, audio_path: str) -> s
         
         logger.info(f"Merging video {video_path} with audio {audio_path}")
         
-        # Merge with exact 5-second duration
+        # Merge with exact 3.5-second duration
         cmd = [
             'ffmpeg', '-y',
             '-i', video_path,  # Video input
@@ -647,7 +645,7 @@ async def _merge_video_audio_standardized(video_path: str, audio_path: str) -> s
             '-c:v', 'copy',  # Copy video stream (already standardized)
             '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',  # Standardize audio
             '-movflags', '+faststart',
-            '-t', '5.0',  # Exact 5 seconds
+            '-t', '3.5',  # Exact 3.5 seconds
             '-shortest',  # Stop when shortest stream ends
             '-avoid_negative_ts', 'make_zero',  # Fix timestamp issues
             str(merged_path)
@@ -666,7 +664,7 @@ async def _merge_video_audio_standardized(video_path: str, audio_path: str) -> s
                 '-i', video_path,
                 '-c:v', 'copy',
                 '-an',  # No audio
-                '-t', '5.0',
+                '-t', '3.5',
                 str(merged_path)
             ]
             
@@ -971,33 +969,31 @@ async def _save_chat_messages_to_firebase(sender_uid: str, receiver_list: list, 
         # Just log the error and continue
 
 def _predict_video(image_path: str, prompt: str):
-    """Synchronous function to call the Gradio client for 5-second video"""
+    """Synchronous function to call the Gradio client for 3.5-second video"""
     try:
-        enhanced_prompt = f"{prompt} do not change the face of the person, do not change the face, keep the face clear"
+        enhanced_prompt = f"{prompt} bring this image to life with cinematic motion and smooth animation"
+        negative_prompt = "vivid tone, overexposed, static, blurry details, subtitles, stylized, artwork, painting, screen, static, grayscale, worst quality, low quality, JPEG artifacts, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn face, deformed, distorted, malformed limbs, fused fingers, static frame, messy background, three legs, crowded background, walking backwards"
+        
         return client.predict(
+            input_image=handle_file(image_path),
             prompt=enhanced_prompt,
-            negative_prompt="worst quality, inconsistent motion, blurry face, artifacts,distorted face,distorted video,distorted motion,blurry video,blur face,changed face,new face,changed facial appearance",
-            input_image_filepath=handle_file(image_path),
-            input_video_filepath=None,
-            height_ui=STANDARD_HEIGHT,  # Use consistent height
-            width_ui=STANDARD_WIDTH,    # Use consistent width
-            mode="image-to-video",
-            duration_ui=2,  # 5 seconds
-            ui_frames_to_use=9,  # 25 frames for 5 seconds at 5fps (AI model standard)
-            seed_ui=42,
+            steps=6,
+            negative_prompt=negative_prompt,
+            duration_seconds=3.5,
+            guidance_scale=1,
+            guidance_scale_2=1,
+            seed=42,
             randomize_seed=True,
-            ui_guidance_scale=5,
-            improve_texture_flag=True,
-            api_name="/image_to_video"
+            api_name="/generate_video"
         )
     except Exception as e:
         logger.error(f"Gradio client prediction failed: {e}")
         raise
 
 def _predict_audio(prompt: str):
-    """Synchronous function to call the Audio Gradio client for 5-second audio"""
+    """Synchronous function to call the Audio Gradio client for 3.5-second audio"""
     try:
-        logger.info(f"Generating 5-second audio with prompt: {prompt}")
+        logger.info(f"Generating 3.5-second audio with prompt: {prompt}")
         
         result = audio_client.predict(
             prompt=prompt,
