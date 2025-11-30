@@ -12,6 +12,7 @@ from gradio_client import Client, handle_file
 from dotenv import load_dotenv
 from supabase import create_client, Client as SupabaseClient
 import uvicorn
+import httpx
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -57,11 +58,21 @@ async def startup_event():
     global wan_client, audio_client, supabase
     try:
         logger.info("Initializing WAN2_2 Video client...")
-        wan_client = Client("Heartsync/wan2_2-I2V-14B-FAST", token=HF_TOKEN)
+        # Add timeout configuration
+        wan_client = Client(
+            "Heartsync/wan2_2-I2V-14B-FAST", 
+            token=HF_TOKEN,
+            httpx_kwargs={"timeout": httpx.Timeout(60.0, connect=30.0, read=60.0)}
+        )
         logger.info("WAN2_2 Video client initialized successfully")
 
         logger.info("Initializing Audio Gradio client...")
-        audio_client = Client("hkchengrex/MMAudio", token=HF_TOKEN)
+        # Add timeout configuration
+        audio_client = Client(
+            "hkchengrex/MMAudio", 
+            token=HF_TOKEN,
+            httpx_kwargs={"timeout": httpx.Timeout(60.0, connect=30.0, read=60.0)}
+        )
         logger.info("Audio Gradio client initialized successfully")
         
         logger.info("Initializing Supabase client...")
@@ -69,7 +80,8 @@ async def startup_event():
         logger.info("Supabase client initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize clients: {e}")
-        raise
+        # Don't raise - allow server to start even if clients fail
+        logger.warning("Server starting with failed clients - they will be retried on first request")
 
 @app.get("/health")
 async def health_check():
@@ -166,6 +178,36 @@ def extract_verbs_and_nouns(prompt: str) -> str:
     logger.info(f"Extracted audio prompt: {result}")
     return result
 
+async def ensure_clients_ready():
+    """Ensure clients are initialized, retry if needed"""
+    global wan_client, audio_client
+    
+    if wan_client is None:
+        logger.info("Retrying WAN2_2 Video client initialization...")
+        try:
+            wan_client = Client(
+                "Heartsync/wan2_2-I2V-14B-FAST", 
+                token=HF_TOKEN,
+                httpx_kwargs={"timeout": httpx.Timeout(60.0, connect=30.0, read=60.0)}
+            )
+            logger.info("WAN2_2 Video client initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize WAN2_2 client: {e}")
+            raise HTTPException(status_code=503, detail="AI video service unavailable")
+    
+    if audio_client is None:
+        logger.info("Retrying Audio Gradio client initialization...")
+        try:
+            audio_client = Client(
+                "hkchengrex/MMAudio", 
+                token=HF_TOKEN,
+                httpx_kwargs={"timeout": httpx.Timeout(60.0, connect=30.0, read=60.0)}
+            )
+            logger.info("Audio Gradio client initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Audio client: {e}")
+            raise HTTPException(status_code=503, detail="AI audio service unavailable")
+
 @app.post("/generate/")
 async def generate_video(
     file: UploadFile = File(...),
@@ -239,14 +281,9 @@ async def generate_video(
             video_url = await _upload_video_to_supabase(str(temp_video_path), sender_uid)
             logger.info(f"Video uploaded to Supabase: {video_url}")
         else:
-            # Process with API
-            # Check if clients are available
-            if wan_client is None:
-                raise HTTPException(status_code=503, detail="AI video service not available")
+            # Ensure clients are ready before processing
+            await ensure_clients_ready()
             
-            if audio_client is None:
-                raise HTTPException(status_code=503, detail="AI audio service not available")
-
             # Process video: extract middle frame and video parts
             logger.info("Processing video: extracting parts with middle frame...")
             middle_frame_path, first_part_path, middle_frame_video_path = await _process_video_with_middle_frame(str(temp_video_path))
