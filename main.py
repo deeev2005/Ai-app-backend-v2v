@@ -11,7 +11,6 @@ from gradio_client import Client, handle_file
 from dotenv import load_dotenv
 from supabase import create_client, Client as SupabaseClient
 import uvicorn
-import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -52,55 +51,16 @@ STANDARD_WIDTH = 544
 STANDARD_HEIGHT = 960
 STANDARD_FPS = 24  # Use 24fps as standard (works well for most content)
 
-def initialize_gradio_client_with_retry(space_name: str, max_retries: int = 5, initial_delay: float = 2.0):
-    """Initialize Gradio client with exponential backoff retry logic"""
-    for attempt in range(max_retries):
-        try:
-            logger.info(f"Attempting to initialize Gradio client for {space_name} (attempt {attempt + 1}/{max_retries})...")
-            
-            # Add headers to force full content response
-            client = Client(
-                space_name, 
-                token=HF_TOKEN, 
-                httpx_kwargs={
-                    "timeout": 3000.0,
-                    "headers": {
-                        "Range": None,  # Prevent partial content requests
-                        "Accept": "application/json"
-                    }
-                }
-            )
-            
-            logger.info(f"Successfully initialized Gradio client for {space_name}")
-            return client
-            
-        except Exception as e:
-            logger.warning(f"Attempt {attempt + 1} failed for {space_name}: {e}")
-            
-            if attempt < max_retries - 1:
-                delay = initial_delay * (2 ** attempt)  # Exponential backoff
-                logger.info(f"Retrying in {delay} seconds...")
-                time.sleep(delay)
-            else:
-                logger.error(f"All {max_retries} attempts failed for {space_name}")
-                raise
-
 @app.on_event("startup")
 async def startup_event():
     global client, audio_client, supabase
     try:
-        # Initialize video client with retry logic
-        client = await asyncio.to_thread(
-            initialize_gradio_client_with_retry,
-            "Heartsync/wan2_2-I2V-14B-FAST"
-        )
-        
-        # Initialize audio client with retry logic
+        logger.info("Initializing Gradio client...")
+        client = Client("Lightricks/ltx-video-distilled", hf_token=HF_TOKEN)
+        logger.info("Gradio client initialized successfully")
+
         logger.info("Initializing Audio Gradio client...")
-        audio_client = await asyncio.to_thread(
-            initialize_gradio_client_with_retry,
-            "chenxie95/MeanAudio"
-        )
+        audio_client = Client("chenxie95/MeanAudio", hf_token=HF_TOKEN)
         logger.info("Audio Gradio client initialized successfully")
         
         logger.info("Initializing Supabase client...")
@@ -355,7 +315,7 @@ async def _process_video_with_middle_frame(video_path: str) -> tuple:
         
         # Calculate split points
         middle_time = duration / 2
-        ai_duration = 3.5  # AI video is 3.5 seconds (changed from 5.0)
+        ai_duration = 5.0  # AI video is exactly 5 seconds
         
         logger.info(f"Split points - Middle: {middle_time}s, AI duration: {ai_duration}s")
         
@@ -585,7 +545,7 @@ async def _standardize_video(video_path: str, is_ai_video: bool = False) -> str:
                 '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
                 '-c:a', 'aac', '-b:a', '128k',
                 '-movflags', '+faststart',
-                '-t', '3.5',  # Ensure exactly 3.5 seconds
+                '-t', '5.0',  # Ensure exactly 5 seconds
                 str(standardized_path)
             ]
         else:
@@ -635,7 +595,7 @@ async def _repair_audio(audio_path: str) -> str:
             '-ac', '2',  # Force stereo
             '-c:a', 'pcm_s16le',  # Uncompressed PCM (most compatible)
             '-af', 'aresample=48000:async=1:first_pts=0',  # Resample and fix timing
-            '-t', '3.5',  # Exact 3.5 seconds
+            '-t', '5.0',  # Exact 5 seconds
             str(repaired_path)
         ]
         
@@ -645,11 +605,11 @@ async def _repair_audio(audio_path: str) -> str:
         
         if result.returncode != 0:
             logger.warning(f"Audio repair failed, creating silence: {result.stderr}")
-            # If repair fails, create 3.5 seconds of silence as fallback
+            # If repair fails, create 5 seconds of silence as fallback
             cmd_silence = [
                 'ffmpeg', '-y',
                 '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
-                '-t', '3.5',
+                '-t', '5.0',
                 '-c:a', 'pcm_s16le',
                 str(repaired_path)
             ]
@@ -679,7 +639,7 @@ async def _merge_video_audio_standardized(video_path: str, audio_path: str) -> s
         
         logger.info(f"Merging video {video_path} with audio {audio_path}")
         
-        # Merge with exact 3.5-second duration
+        # Merge with exact 5-second duration
         cmd = [
             'ffmpeg', '-y',
             '-i', video_path,  # Video input
@@ -687,7 +647,7 @@ async def _merge_video_audio_standardized(video_path: str, audio_path: str) -> s
             '-c:v', 'copy',  # Copy video stream (already standardized)
             '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',  # Standardize audio
             '-movflags', '+faststart',
-            '-t', '3.5',  # Exact 3.5 seconds
+            '-t', '5.0',  # Exact 5 seconds
             '-shortest',  # Stop when shortest stream ends
             '-avoid_negative_ts', 'make_zero',  # Fix timestamp issues
             str(merged_path)
@@ -706,7 +666,7 @@ async def _merge_video_audio_standardized(video_path: str, audio_path: str) -> s
                 '-i', video_path,
                 '-c:v', 'copy',
                 '-an',  # No audio
-                '-t', '3.5',
+                '-t', '5.0',
                 str(merged_path)
             ]
             
@@ -1011,31 +971,33 @@ async def _save_chat_messages_to_firebase(sender_uid: str, receiver_list: list, 
         # Just log the error and continue
 
 def _predict_video(image_path: str, prompt: str):
-    """Synchronous function to call the Gradio client for 3.5-second video"""
+    """Synchronous function to call the Gradio client for 5-second video"""
     try:
-        enhanced_prompt = f"{prompt} bring this image to life with cinematic motion and smooth animation"
-        negative_prompt = "vivid tone, overexposed, static, blurry details, subtitles, stylized, artwork, painting, screen, static, grayscale, worst quality, low quality, JPEG artifacts, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn face, deformed, distorted, malformed limbs, fused fingers, static frame, messy background, three legs, crowded background, walking backwards"
-        
+        enhanced_prompt = f"{prompt} do not change the face of the person, do not change the face, keep the face clear"
         return client.predict(
-            input_image=handle_file(image_path),
             prompt=enhanced_prompt,
-            steps=6,
-            negative_prompt=negative_prompt,
-            duration_seconds=3.5,
-            guidance_scale=1,
-            guidance_scale_2=1,
-            seed=42,
+            negative_prompt="worst quality, inconsistent motion, blurry face, artifacts,distorted face,distorted video,distorted motion,blurry video,blur face,changed face,new face,changed facial appearance",
+            input_image_filepath=handle_file(image_path),
+            input_video_filepath=None,
+            height_ui=STANDARD_HEIGHT,  # Use consistent height
+            width_ui=STANDARD_WIDTH,    # Use consistent width
+            mode="image-to-video",
+            duration_ui=2,  # 5 seconds
+            ui_frames_to_use=9,  # 25 frames for 5 seconds at 5fps (AI model standard)
+            seed_ui=42,
             randomize_seed=True,
-            api_name="/generate_video"
+            ui_guidance_scale=5,
+            improve_texture_flag=True,
+            api_name="/image_to_video"
         )
     except Exception as e:
         logger.error(f"Gradio client prediction failed: {e}")
         raise
 
 def _predict_audio(prompt: str):
-    """Synchronous function to call the Audio Gradio client for 3.5-second audio"""
+    """Synchronous function to call the Audio Gradio client for 5-second audio"""
     try:
-        logger.info(f"Generating 3.5-second audio with prompt: {prompt}")
+        logger.info(f"Generating 5-second audio with prompt: {prompt}")
         
         result = audio_client.predict(
             prompt=prompt,
@@ -1085,6 +1047,6 @@ if __name__ == "__main__":
         app, 
         host="0.0.0.0", 
         port=8000,
-        timeout_keep_alive=30000,  # 5 minutes keep alive
+        timeout_keep_alive=300,  # 5 minutes keep alive
         timeout_graceful_shutdown=30
     )
