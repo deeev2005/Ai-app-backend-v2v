@@ -62,7 +62,7 @@ async def startup_event():
         wan_client = Client(
             "Heartsync/wan2_2-I2V-14B-FAST", 
             token=HF_TOKEN,
-            httpx_kwargs={"timeout": httpx.Timeout(60.0, connect=30.0, read=60.0)}
+            httpx_kwargs={"timeout": httpx.Timeout(6000.0, connect=30.0, read=60.0)}
         )
         logger.info("WAN2_2 Video client initialized successfully")
 
@@ -71,7 +71,7 @@ async def startup_event():
         audio_client = Client(
             "hkchengrex/MMAudio", 
             token=HF_TOKEN,
-            httpx_kwargs={"timeout": httpx.Timeout(60.0, connect=30.0, read=60.0)}
+            httpx_kwargs={"timeout": httpx.Timeout(6000.0, connect=30.0, read=60.0)}
         )
         logger.info("Audio Gradio client initialized successfully")
         
@@ -188,7 +188,7 @@ async def ensure_clients_ready():
             wan_client = Client(
                 "Heartsync/wan2_2-I2V-14B-FAST", 
                 token=HF_TOKEN,
-                httpx_kwargs={"timeout": httpx.Timeout(60.0, connect=30.0, read=60.0)}
+                httpx_kwargs={"timeout": httpx.Timeout(6000.0, connect=30.0, read=60.0)}
             )
             logger.info("WAN2_2 Video client initialized successfully")
         except Exception as e:
@@ -201,7 +201,7 @@ async def ensure_clients_ready():
             audio_client = Client(
                 "hkchengrex/MMAudio", 
                 token=HF_TOKEN,
-                httpx_kwargs={"timeout": httpx.Timeout(60.0, connect=30.0, read=60.0)}
+                httpx_kwargs={"timeout": httpx.Timeout(6000.0, connect=30.0, read=60.0)}
             )
             logger.info("Audio Gradio client initialized successfully")
         except Exception as e:
