@@ -173,7 +173,7 @@ async def generate_video(
     sender_uid: str = Form(...),
     receiver_uids: str = Form(...)
 ):
-    """Generate video with middle frame + AI video (with audio) + stitching"""
+    """Generate video with middle frame + AI video (with audio) merged back"""
     temp_files = []  # Track all temp files for cleanup
 
     try:
@@ -247,10 +247,24 @@ async def generate_video(
             if audio_client is None:
                 raise HTTPException(status_code=503, detail="AI audio service not available")
 
-            # Process video: extract middle frame and parts
+            # Process video: extract middle frame and video parts
             logger.info("Processing video: extracting parts with middle frame...")
             middle_frame_path, first_part_path, middle_frame_video_path = await _process_video_with_middle_frame(str(temp_video_path))
             temp_files.extend([middle_frame_path, first_part_path, middle_frame_video_path])
+
+            # Apply EXIF orientation to ensure middle frame is upright
+            from PIL import Image, ImageOps
+            try:
+                with Image.open(middle_frame_path) as img:
+                    # Apply EXIF orientation to correct rotation automatically
+                    corrected_img = ImageOps.exif_transpose(img)
+                    if corrected_img is None:
+                        # If no EXIF data, use original image
+                        corrected_img = img
+                    corrected_img.save(middle_frame_path)
+                    logger.info(f"Middle frame orientation corrected using EXIF data")
+            except Exception as e:
+                logger.warning(f"Failed to correct middle frame orientation: {e}, proceeding with original frame")
 
             # Generate video with WAN2_2 API using middle frame
             logger.info(f"Starting video generation with WAN2_2 API using middle frame and prompt: {magic_prompt}")
@@ -263,36 +277,32 @@ async def generate_video(
             if not video_result or len(video_result) < 2:
                 raise HTTPException(status_code=500, detail="Invalid response from WAN2_2 video AI model")
 
-            local_video_path = video_result[0].get("video") if isinstance(video_result[0], dict) else video_result[0]
+            ai_video_path = video_result[0].get("video") if isinstance(video_result[0], dict) else video_result[0]
             seed_used = video_result[1] if len(video_result) > 1 else "unknown"
 
-            logger.info(f"AI Video generated locally: {local_video_path}")
+            logger.info(f"AI Video generated locally: {ai_video_path}")
 
             # Generate audio using the AI video file
             logger.info("Starting audio generation with AI video...")
             
             audio_result = await asyncio.wait_for(
-                asyncio.to_thread(_predict_audio, local_video_path, magic_prompt),
+                asyncio.to_thread(_predict_audio, ai_video_path, magic_prompt),
                 timeout=300.0  # 5 minutes timeout
             )
 
             if not audio_result:
                 raise HTTPException(status_code=500, detail="Invalid response from audio AI model")
 
-            local_audio_path = audio_result
-            logger.info(f"Audio generated locally: {local_audio_path}")
+            ai_audio_path = audio_result
+            logger.info(f"AI Audio generated locally: {ai_audio_path}")
 
-            # Merge AI video with generated audio
-            ai_merged_path = await _merge_video_audio(local_video_path, local_audio_path)
+            # Merge AI video with AI audio
+            ai_merged_path = await _merge_video_audio(ai_video_path, ai_audio_path)
             temp_files.append(ai_merged_path)
-            logger.info(f"AI video merged with audio: {ai_merged_path}")
+            logger.info(f"AI video merged with AI audio: {ai_merged_path}")
 
-            # Standardize AI merged video
-            ai_standardized = await _standardize_video(ai_merged_path, is_ai_video=True)
-            temp_files.append(ai_standardized)
-
-            # Create final video by concatenating: first_part + middle_frame + ai_video_with_audio
-            final_video_path = await _concatenate_videos_standardized([first_part_path, middle_frame_video_path, ai_standardized])
+            # Create final video by concatenating: first_part + middle_frame_video + ai_merged_video
+            final_video_path = await _concatenate_videos_standardized([first_part_path, middle_frame_video_path, ai_merged_path])
             temp_files.append(final_video_path)
             logger.info(f"Final video created: {final_video_path}")
 
@@ -342,7 +352,7 @@ async def generate_video(
                     logger.warning(f"Failed to cleanup temp file {temp_path}: {e}")
 
 async def _process_video_with_middle_frame(video_path: str) -> tuple:
-    """Extract parts: first_part + middle_frame (only these, no audio extraction)"""
+    """Extract parts: first_part + middle_frame + middle_frame_video"""
     try:
         import subprocess
         
@@ -503,55 +513,6 @@ def _predict_video_wan(image_path: str, prompt: str):
     except Exception as e:
         logger.error(f"WAN2_2 video generation failed: {e}")
         raise
-
-async def _standardize_video(video_path: str, is_ai_video: bool = False) -> str:
-    """Standardize video to consistent format"""
-    try:
-        import subprocess
-        
-        temp_dir = Path("/tmp")
-        output_id = str(uuid.uuid4())
-        standardized_path = temp_dir / f"{output_id}_standardized.mp4"
-        
-        logger.info(f"Standardizing video: {video_path}")
-        
-        if is_ai_video:
-            # AI video should already be correct size but ensure FPS and encoding
-            cmd = [
-                'ffmpeg', '-y', '-i', video_path,
-                '-r', str(STANDARD_FPS),  # Ensure standard FPS
-                '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
-                '-c:a', 'aac', '-b:a', '128k',
-                '-movflags', '+faststart',
-                '-t', '3.5',  # Ensure exactly 3.5 seconds
-                str(standardized_path)
-            ]
-        else:
-            # Regular video - scale and standardize
-            cmd = [
-                'ffmpeg', '-y', '-i', video_path,
-                '-vf', f'scale={STANDARD_WIDTH}:{STANDARD_HEIGHT}:force_original_aspect_ratio=decrease,pad={STANDARD_WIDTH}:{STANDARD_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black',
-                '-r', str(STANDARD_FPS),
-                '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
-                '-c:a', 'aac', '-b:a', '128k',
-                '-movflags', '+faststart',
-                str(standardized_path)
-            ]
-        
-        result = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True, timeout=120
-        )
-        
-        if result.returncode != 0:
-            logger.error(f"FFmpeg standardization failed: {result.stderr}")
-            raise Exception(f"Video standardization failed: {result.stderr}")
-        
-        logger.info(f"Successfully standardized video: {standardized_path}")
-        return str(standardized_path)
-        
-    except Exception as e:
-        logger.error(f"Failed to standardize video: {e}")
-        raise Exception(f"Video standardization failed: {str(e)}")
 
 async def _merge_video_audio(video_path: str, audio_path: str) -> str:
     """Merge video and audio files using ffmpeg"""
