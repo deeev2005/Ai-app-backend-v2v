@@ -56,11 +56,11 @@ async def startup_event():
     global client, audio_client, supabase
     try:
         logger.info("Initializing Gradio client...")
-        client = Client("Heartsync/wan2_2-I2V-14B-FAST", token=HF_TOKEN)
+        client = Client("Heartsync/wan2_2-I2V-14B-FAST", token=HF_TOKEN, timeout=300)
         logger.info("Gradio client initialized successfully")
 
         logger.info("Initializing Audio Gradio client...")
-        audio_client = Client("chenxie95/MeanAudio", token=HF_TOKEN)
+        audio_client = Client("chenxie95/MeanAudio", token=HF_TOKEN, timeout=300)
         logger.info("Audio Gradio client initialized successfully")
         
         logger.info("Initializing Supabase client...")
