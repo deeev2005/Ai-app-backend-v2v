@@ -56,11 +56,11 @@ async def startup_event():
     global client, audio_client, supabase
     try:
         logger.info("Initializing Gradio client...")
-        client = Client("Lightricks/ltx-video-distilled", hf_token=HF_TOKEN)
+        client = Client("Lightricks/ltx-video-distilled", token=HF_TOKEN)
         logger.info("Gradio client initialized successfully")
 
         logger.info("Initializing Audio Gradio client...")
-        audio_client = Client("chenxie95/MeanAudio", hf_token=HF_TOKEN)
+        audio_client = Client("chenxie95/MeanAudio", token=HF_TOKEN)
         logger.info("Audio Gradio client initialized successfully")
         
         logger.info("Initializing Supabase client...")
