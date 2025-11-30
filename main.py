@@ -408,7 +408,9 @@ async def _process_video_with_middle_frame(video_path: str) -> tuple:
                     '-t', str(ai_duration),
                     '-c:a', 'pcm_s16le',
                     str(remaining_audio_path)
-                ]result = await asyncio.to_thread(
+                ]
+                
+                result = await asyncio.to_thread(
                     subprocess.run, cmd_silence, capture_output=True, text=True, timeout=30
                 )
                 
