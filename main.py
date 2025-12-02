@@ -333,7 +333,7 @@ async def generate_video(
             logger.info(f"AI Video with audio generated locally: {ai_video_with_audio_path}")
 
             # Create final video by concatenating: first_part + middle_frame_video + ai_video_with_audio
-            final_video_path = await _concatenate_videos_standardized([first_part_path, middle_frame_video_path, ai_video_with_audio_path])
+            final_video_path = await _concatenate_videos_standardized([first_part_path, ai_video_with_audio_path])
             temp_files.append(final_video_path)
             logger.info(f"Final video created: {final_video_path}")
 
