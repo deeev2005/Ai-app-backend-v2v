@@ -532,8 +532,8 @@ def _predict_video_wan(image_path: str, prompt: str):
         return wan_client.predict(
             input_image=handle_file(image_path),
             prompt=prompt,
-            steps=8,
-            negative_prompt=" multiple bodies, overlapping bodies, ghost limbs, duplicate limbs, jitter, unstable movement, morphing face, morphing identity, extra head, extra arms, multiple poses, fast dancing, energetic dancing, motion blur, identity drift,多个身体, 重叠的身体, 幽灵般的肢体, 重复的肢体, 抖动, 不稳定的动作, 变形的脸, 变形的身份, 多余的头部, 多余的手臂, 多个姿势, 快速舞动, 充满活力的舞蹈, 运动模糊, 身份漂移 ",
+            steps=10,
+            negative_prompt=" multiple bodies, overlapping bodies, ghost limbs, duplicate limbs, jitter, unstable movement, morphing face, morphing identity, extra head, extra arms, multiple poses, fast dancing, energetic dancing, motion blur, identity drift,多个身体, 重叠的身体, 幽灵般的肢体, 重复的肢体, 抖动, 不稳定的动作, 变形的脸, 变形的身份, 多余的头部, 多余的手臂, 多个姿势, 快速舞动, 充满活力的舞蹈, 运动模糊, 身份漂移,错误的解剖结构, 畸形的身体, 变异的肢体, 多余的肢体, 多余的腿, 多余的手臂, 缺失的手臂, 缺失的腿, 扭曲的脸, 不对称的眼睛, 融合的手指, 多余的手指, 过长的脖子, 扭曲的脊柱, 断裂的肢体, 畸形的脚, 畸形的头部, 错误的面部结构, 不真实的面部表情, 诡异的微笑, 扭曲的嘴巴, 错误的手部, 丑陋的面孔, 低细节的皮肤, 错误的皮肤纹理, 诡异的外观, 不一致的服装, 闪烁的人物设计, 变形的脸, 身份变化, 人物重复, 畸形的阴影 ",
             duration_seconds=3.5,
             guidance_scale=1,
             guidance_scale_2=1,
