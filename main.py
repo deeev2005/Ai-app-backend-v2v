@@ -319,27 +319,21 @@ async def generate_video(
 
             logger.info(f"AI Video generated locally: {ai_video_path}")
 
-            # Generate audio using the AI video file
+            # Generate audio using the AI video file (MMAudio returns video with audio embedded)
             logger.info("Starting audio generation with AI video...")
             
-            audio_result = await asyncio.wait_for(
+            ai_video_with_audio_path = await asyncio.wait_for(
                 asyncio.to_thread(_predict_audio, ai_video_path, magic_prompt),
                 timeout=300.0  # 5 minutes timeout
             )
 
-            if not audio_result:
+            if not ai_video_with_audio_path:
                 raise HTTPException(status_code=500, detail="Invalid response from audio AI model")
 
-            ai_audio_path = audio_result
-            logger.info(f"AI Audio generated locally: {ai_audio_path}")
+            logger.info(f"AI Video with audio generated locally: {ai_video_with_audio_path}")
 
-            # Merge AI video with AI audio
-            ai_merged_path = await _merge_video_audio(ai_video_path, ai_audio_path)
-            temp_files.append(ai_merged_path)
-            logger.info(f"AI video merged with AI audio: {ai_merged_path}")
-
-            # Create final video by concatenating: first_part + middle_frame_video + ai_merged_video
-            final_video_path = await _concatenate_videos_standardized([first_part_path, middle_frame_video_path, ai_merged_path])
+            # Create final video by concatenating: first_part + middle_frame_video + ai_video_with_audio
+            final_video_path = await _concatenate_videos_standardized([first_part_path, middle_frame_video_path, ai_video_with_audio_path])
             temp_files.append(final_video_path)
             logger.info(f"Final video created: {final_video_path}")
 
@@ -501,7 +495,7 @@ async def _process_video_with_middle_frame(video_path: str) -> tuple:
         raise Exception(f"Video processing failed: {str(e)}")
 
 def _predict_audio(video_path: str, prompt: str):
-    """Synchronous function to call the MMAudio Gradio client"""
+    """Synchronous function to call the MMAudio Gradio client - returns video with audio embedded"""
     try:
         # Extract verbs and nouns from the prompt
         audio_prompt = extract_verbs_and_nouns(prompt)
@@ -522,7 +516,7 @@ def _predict_audio(video_path: str, prompt: str):
         
         logger.info(f"Audio generation result: {result}")
         
-        # Extract the audio file path from the result
+        # MMAudio returns a video file with audio embedded, not just audio
         if isinstance(result, dict) and "video" in result:
             return result["video"]
         else:
@@ -538,8 +532,8 @@ def _predict_video_wan(image_path: str, prompt: str):
         return wan_client.predict(
             input_image=handle_file(image_path),
             prompt=prompt,
-            steps=4,
-            negative_prompt=" multiple bodies, overlapping bodies, ghost limbs, duplicate limbs, jitter, unstable movement, morphing face, morphing identity, extra head, extra arms, multiple poses, fast dancing, energetic dancing, motion blur, identity drift ",
+            steps=8,
+            negative_prompt=" multiple bodies, overlapping bodies, ghost limbs, duplicate limbs, jitter, unstable movement, morphing face, morphing identity, extra head, extra arms, multiple poses, fast dancing, energetic dancing, motion blur, identity drift,多个身体, 重叠的身体, 幽灵般的肢体, 重复的肢体, 抖动, 不稳定的动作, 变形的脸, 变形的身份, 多余的头部, 多余的手臂, 多个姿势, 快速舞动, 充满活力的舞蹈, 运动模糊, 身份漂移 ",
             duration_seconds=3.5,
             guidance_scale=1,
             guidance_scale_2=1,
@@ -550,52 +544,6 @@ def _predict_video_wan(image_path: str, prompt: str):
     except Exception as e:
         logger.error(f"WAN2_2 video generation failed: {e}")
         raise
-
-async def _merge_video_audio(video_path: str, audio_path: str) -> str:
-    """Merge video and audio files using ffmpeg"""
-    try:
-        import subprocess
-        
-        # Generate output path
-        temp_dir = Path("/tmp")
-        output_id = str(uuid.uuid4())
-        merged_path = temp_dir / f"{output_id}_merged.mp4"
-        
-        logger.info(f"Merging video {video_path} with audio {audio_path}")
-        
-        # Use ffmpeg to merge video and audio
-        cmd = [
-            'ffmpeg', '-y',  # -y to overwrite output file
-            '-i', video_path,  # input video
-            '-i', audio_path,  # input audio
-            '-c:v', 'copy',    # copy video codec (no re-encoding)
-            '-c:a', 'aac',     # encode audio to AAC
-            '-strict', 'experimental',
-            '-shortest',       # finish when shortest stream ends
-            str(merged_path)
-        ]
-        
-        # Run ffmpeg command
-        result = await asyncio.to_thread(
-            subprocess.run, cmd, 
-            capture_output=True, 
-            text=True, 
-            timeout=120  # 2 minute timeout for merging
-        )
-        
-        if result.returncode != 0:
-            logger.error(f"FFmpeg failed: {result.stderr}")
-            raise Exception(f"Video-audio merging failed: {result.stderr}")
-        
-        if not merged_path.exists():
-            raise Exception("Merged video file was not created")
-        
-        logger.info(f"Successfully merged video and audio: {merged_path}")
-        return str(merged_path)
-        
-    except Exception as e:
-        logger.error(f"Failed to merge video and audio: {e}")
-        raise Exception(f"Video-audio merging failed: {str(e)}")
 
 async def _concatenate_videos_standardized(video_paths: list) -> str:
     """Concatenate videos with consistent encoding"""
